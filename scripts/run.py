@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 import os, sys, asyncio, traceback
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-TZ = "Asia/Kolkata"
 BASE = Path(__file__).resolve().parent
 OUT = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
 def today_str():
     # Use IST date in filename
-    from datetime import timezone, timedelta
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist).strftime("%Y-%m-%d")
 
@@ -50,40 +48,85 @@ async def site_login_and_download():
     nameA       = os.getenv("REPORT_A_NAME", "ReportA")
     nameB       = os.getenv("REPORT_B_NAME", "ReportB")
     stamp       = today_str()
+    user_type   = os.getenv("USER_TYPE", "").strip()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox","--disable-dev-shm-usage"]
+        )
         context = await browser.new_context(accept_downloads=True)
+        # Be a bit more patient than defaults
+        context.set_default_timeout(60000)                 # 60s for actions
+        context.set_default_navigation_timeout(120000)     # 120s for page.goto
         page = await context.new_page()
 
         # 1) Login page
-        await page.goto(login_url, wait_until="domcontentloaded")
-        # --- choose user type (custom dropdown) ---
-user_type = os.getenv("USER_TYPE", "").strip()
-if user_type:
-    # Click the dropdown control to open the menu
-    # CHANGE "#userTypeDropdown" to the actual selector for the dropdown box/button
-    for sel in ["#userTypeDropdown", "[data-testid='user-type']", "div.select-user-type"]:
-        try:
-            if await page.locator(sel).count():
-                await page.click(sel)
+        # try a couple times in case of slow CDN/redirects
+        last_err = None
+        for _ in range(2):
+            try:
+                await page.goto(login_url, wait_until="load")
+                await page.wait_for_load_state("networkidle", timeout=60000)
                 break
-        except:
-            pass
-    # Click the visible option text
-    await page.get_by_text(user_type, exact=True).click()
- # CHANGE these selectors if your site uses different names/IDs:
+            except PWTimeout as e:
+                last_err = e
+        if last_err:
+            raise last_err
+
+        # --- Select User Type (do this BEFORE typing username/password) ---
+        if user_type:
+            # Try native <select> first (update IDs/names if your site differs)
+            selected = False
+            for sel in ["select#userType", "select[name='userType']", "select#user_type"]:
+                if await page.locator(sel).count():
+                    try:
+                        await page.select_option(sel, label=user_type)
+                        selected = True
+                        break
+                    except Exception:
+                        pass
+            if not selected:
+                # Fallback for custom dropdowns (click to open, then click option text)
+                for sel in ["#userTypeDropdown", "[data-testid='user-type']", "div.select-user-type"]:
+                    if await page.locator(sel).count():
+                        await page.click(sel)
+                        await page.get_by_text(user_type, exact=True).click()
+                        selected = True
+                        break
+            log(f"User type selected: {user_type} (selected={selected})")
+
+        # --- Fill username and password (adjust selectors if needed) ---
         if await page.locator("input[name='username']").count():
             await page.fill("input[name='username']", username)
+        elif await page.locator("#email").count():
+            await page.fill("#email", username)
+
+        if await page.locator("input[name='password']").count():
             await page.fill("input[name='password']", password)
-            await page.click("button[type='submit']")
-            await page.wait_for_load_state("networkidle")
+        elif await page.locator("#pwd").count():
+            await page.fill("#pwd", password)
+
+        # Click the login/submit button (several common variants)
+        for sel in [
+            "button:has-text('Sign in')",
+            "button:has-text('Login')",
+            "button[type='submit']",
+            "[role='button']:has-text('Sign in')",
+        ]:
+            try:
+                await page.click(sel, timeout=3000)
+                break
+            except Exception:
+                pass
+
+        await page.wait_for_load_state("networkidle", timeout=60000)
 
         # 2) Report A — EDIT these clicks to match your site’s menus/buttons
         async def steps_A(p):
             await p.click("text=Reports")
             await p.click("text=Daily Report A")
-            # If your site needs filters/dates, add clicks here.
+            # Add your filters/dropdowns/date selections here if needed
             await p.click("button:has-text('Download PDF')")
 
         pathA = OUT / f"{nameA}_{stamp}.pdf"
@@ -93,6 +136,7 @@ if user_type:
         async def steps_B(p):
             await p.click("text=Reports")
             await p.click("text=Daily Report B")
+            # Add your filters/dropdowns/date selections here if needed
             await p.click("button:has-text('Download PDF')")
 
         pathB = OUT / f"{nameB}_{stamp}.pdf"
