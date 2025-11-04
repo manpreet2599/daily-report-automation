@@ -58,7 +58,21 @@ async def site_login_and_download():
 
         # 1) Login page
         await page.goto(login_url, wait_until="domcontentloaded")
-        # CHANGE these selectors if your site uses different names/IDs:
+        # --- choose user type (custom dropdown) ---
+user_type = os.getenv("USER_TYPE", "").strip()
+if user_type:
+    # Click the dropdown control to open the menu
+    # CHANGE "#userTypeDropdown" to the actual selector for the dropdown box/button
+    for sel in ["#userTypeDropdown", "[data-testid='user-type']", "div.select-user-type"]:
+        try:
+            if await page.locator(sel).count():
+                await page.click(sel)
+                break
+        except:
+            pass
+    # Click the visible option text
+    await page.get_by_text(user_type, exact=True).click()
+ # CHANGE these selectors if your site uses different names/IDs:
         if await page.locator("input[name='username']").count():
             await page.fill("input[name='username']", username)
             await page.fill("input[name='password']", password)
