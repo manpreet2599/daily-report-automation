@@ -32,6 +32,7 @@ jobs:
       - name: Run automation
         env:
           LOGIN_URL: ${{ secrets.LOGIN_URL }}
+          USER_TYPE: ${{ secrets.USER_TYPE }}
           USERNAME: ${{ secrets.USERNAME }}
           PASSWORD: ${{ secrets.PASSWORD }}
           REPORT_A_NAME: ${{ secrets.REPORT_A_NAME }}
