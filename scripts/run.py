@@ -41,44 +41,68 @@ async def send_via_telegram(files):
             log(f"Telegram send failed for {p}: {r.text}")
             raise RuntimeError("Telegram send failed")
 
+# ---------- helpers to be tolerant with selectors ----------
+async def fill_first(page, candidates, value):
+    for sel in candidates:
+        try:
+            if await page.locator(sel).count():
+                await page.fill(sel, value)
+                return True
+        except Exception:
+            pass
+    return False
+
+async def click_first(page, candidates, timeout=3000):
+    for sel in candidates:
+        try:
+            await page.click(sel, timeout=timeout)
+            return True
+        except Exception:
+            pass
+    return False
+
 async def site_login_and_download():
-    login_url   = os.environ["LOGIN_URL"]
+    # If LOGIN_URL not provided as a secret, default to the real e-Sinchai login
+    login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
     nameA       = os.getenv("REPORT_A_NAME", "ReportA")
     nameB       = os.getenv("REPORT_B_NAME", "ReportB")
-    stamp       = today_str()
     user_type   = os.getenv("USER_TYPE", "").strip()
+    stamp       = today_str()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
         context = await browser.new_context(accept_downloads=True)
-        # Be a bit more patient than defaults
+        # Be more patient than defaults
         context.set_default_timeout(60000)                 # 60s for actions
-        context.set_default_navigation_timeout(120000)     # 120s for page.goto
+        context.set_default_navigation_timeout(180000)     # 180s for page.goto
         page = await context.new_page()
 
-        # 1) Login page
-        # try a couple times in case of slow CDN/redirects
+        # 1) Open login page
+        log(f"Opening login page: {login_url}")
         last_err = None
         for _ in range(2):
             try:
-                await page.goto(login_url, wait_until="load")
-                await page.wait_for_load_state("networkidle", timeout=60000)
+                await page.goto(login_url, wait_until="networkidle")
                 break
             except PWTimeout as e:
                 last_err = e
         if last_err:
             raise last_err
 
-        # --- Select User Type (do this BEFORE typing username/password) ---
+        # Screenshot: initial login page
+        await page.screenshot(path=str(OUT / "step1_login_page.png"), full_page=True)
+
+        # 2) Select User Type (native <select id="usertype"> on e-SInchai)
         if user_type:
-            # Try native <select> first (update IDs/names if your site differs)
+            log(f"Selecting user type: {user_type}")
+            # Try native select first
             selected = False
-            for sel in ["select#userType", "select[name='userType']", "select#user_type"]:
+            for sel in ["select#usertype", "select#userType", "select[name='userType']", "select#user_type"]:
                 if await page.locator(sel).count():
                     try:
                         await page.select_option(sel, label=user_type)
@@ -86,61 +110,66 @@ async def site_login_and_download():
                         break
                     except Exception:
                         pass
+            # Fallback: custom dropdown (click box then option text)
             if not selected:
-                # Fallback for custom dropdowns (click to open, then click option text)
-                for sel in ["#userTypeDropdown", "[data-testid='user-type']", "div.select-user-type"]:
-                    if await page.locator(sel).count():
-                        await page.click(sel)
-                        await page.get_by_text(user_type, exact=True).click()
-                        selected = True
-                        break
-            log(f"User type selected: {user_type} (selected={selected})")
+                for opener in ["#userTypeDropdown", "[data-testid='user-type']", "div.select-user-type", "label:has-text('Select User Type') + *"]:
+                    if await page.locator(opener).count():
+                        try:
+                            await page.click(opener)
+                            await page.get_by_text(user_type, exact=True).click()
+                            selected = True
+                            break
+                        except Exception:
+                            pass
+            log(f"User type selected ok? {selected}")
 
-        # --- Fill username and password (adjust selectors if needed) ---
-        if await page.locator("input[name='username']").count():
-            await page.fill("input[name='username']", username)
-        elif await page.locator("#email").count():
-            await page.fill("#email", username)
+        # 3) Fill username & password (be tolerant with ids/names)
+        user_ok = await fill_first(page,
+            ["input[name='username']", "#username", "input[name='login']", "#login", "input[name='userid']", "#userid", "#loginid", "input[name='loginid']"],
+            username
+        )
+        pass_ok = await fill_first(page,
+            ["input[name='password']", "#password", "input[name='pwd']", "#pwd"],
+            password
+        )
+        log(f"Filled username: {user_ok}, password: {pass_ok}")
+        await page.screenshot(path=str(OUT / "step2_before_login.png"), full_page=True)
 
-        if await page.locator("input[name='password']").count():
-            await page.fill("input[name='password']", password)
-        elif await page.locator("#pwd").count():
-            await page.fill("#pwd", password)
-
-        # Click the login/submit button (several common variants)
-        for sel in [
-            "button:has-text('Sign in')",
+        # 4) Click Login
+        clicked = await click_first(page, [
             "button:has-text('Login')",
+            "button:has-text('Sign in')",
             "button[type='submit']",
-            "[role='button']:has-text('Sign in')",
-        ]:
-            try:
-                await page.click(sel, timeout=3000)
-                break
-            except Exception:
-                pass
+            "[role='button']:has-text('Login')"
+        ], timeout=5000)
+        log(f"Clicked login button? {clicked}")
 
-        await page.wait_for_load_state("networkidle", timeout=60000)
+        # Wait for navigation after login (dashboard)
+        await page.wait_for_load_state("networkidle", timeout=120000)
+        await page.screenshot(path=str(OUT / "step3_after_login.png"), full_page=True)
+        log("Login step complete.")
 
-        # 2) Report A — EDIT these clicks to match your site’s menus/buttons
+        # --------- Report A (EDIT selectors to match your site) ----------
         async def steps_A(p):
             await p.click("text=Reports")
             await p.click("text=Daily Report A")
-            # Add your filters/dropdowns/date selections here if needed
+            # Add filters/date selection here if needed
             await p.click("button:has-text('Download PDF')")
 
         pathA = OUT / f"{nameA}_{stamp}.pdf"
         await download_report(page, steps_A, pathA)
+        log(f"Saved {pathA.name}")
 
-        # 3) Report B — EDIT these clicks to match your site
+        # --------- Report B (EDIT selectors to match your site) ----------
         async def steps_B(p):
             await p.click("text=Reports")
             await p.click("text=Daily Report B")
-            # Add your filters/dropdowns/date selections here if needed
+            # Add filters/date selection here if needed
             await p.click("button:has-text('Download PDF')")
 
         pathB = OUT / f"{nameB}_{stamp}.pdf"
         await download_report(page, steps_B, pathB)
+        log(f"Saved {pathB.name}")
 
         await context.close()
         await browser.close()
