@@ -24,25 +24,22 @@ def log(msg):
 # SAFE PDF DOWNLOAD (bounded; tries popup fallback)
 # ───────────────────────────────────────────────────────────────────────────────
 async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=25000):
-    """
-    Click a control that should trigger a PDF download.
-    If no download event fires, try a popup fallback (viewer window), and grab the PDF from there.
-    """
+    log("[pdf] attempting direct download…")
     try:
         async with p.expect_download(timeout=timeout_ms) as dl_info:
             await click_pdf()
         dl = await dl_info.value
         await dl.save_as(save_as_path)
+        log(f"[pdf] download saved → {save_as_path}")
         return True
     except Exception as e:
-        print(f"[warn] No direct download detected ({e}). Trying popup fallback...", flush=True)
+        log(f"[pdf] no direct download ({e}); trying popup fallback…")
         try:
             async with p.expect_popup(timeout=5000) as pop_info:
                 await click_pdf()
             pop = await pop_info.value
             await pop.wait_for_load_state("load")
 
-            # Try to find a direct PDF link in the popup
             link = pop.locator("a[href$='.pdf'], a[download], a[href*='application/pdf']").first
             if await link.count():
                 async with pop.expect_download(timeout=timeout_ms) as dl_info2:
@@ -50,14 +47,15 @@ async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=25000):
                 dl2 = await dl_info2.value
                 await dl2.save_as(save_as_path)
                 await pop.close()
+                log(f"[pdf] popup → download saved → {save_as_path}")
                 return True
 
-            # Last resort: screenshot the popup for debugging
             await pop.screenshot(path=str(OUT / "popup_after_pdf_click.png"), full_page=True)
             await pop.close()
+            log("[pdf] popup fallback found no link; see popup_after_pdf_click.png")
             return False
         except Exception as e2:
-            print(f"[err] Popup fallback also failed: {e2}", flush=True)
+            log(f"[pdf] popup fallback failed: {e2}")
             return False
 
 # ---------- generic helpers ----------
@@ -74,22 +72,18 @@ async def fill_first(page, candidates, value):
 async def click_first(page, candidates, timeout=3000):
     for sel in candidates:
         try:
-            await page.click(sel, timeout=timeout)
-            return True
+            if await page.locator(sel).count():
+                await page.locator(sel).first.click(timeout=timeout)
+                return True
         except Exception:
             pass
     return False
 
 # --- selects (native and Bootstrap-select fallback) ---
 async def select_by_label_native_or_bootstrap(p, label_text: str, option_text: str):
-    """
-    Try selecting in a normal <select> by label/value.
-    If not found, fallback to Bootstrap-select: click the toggle next to the label and click the option text.
-    """
     label_text = label_text.strip()
     option_text = option_text.strip()
 
-    # Native <select> attempts
     native_candidates = [
         f"label:has-text('{label_text}') + select",
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
@@ -107,7 +101,6 @@ async def select_by_label_native_or_bootstrap(p, label_text: str, option_text: s
                 except Exception:
                     pass
 
-    # Bootstrap-select style fallback:
     toggle_candidates = [
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button",
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[self::button or self::*[contains(@class,'dropdown-toggle')]][1]",
@@ -119,7 +112,6 @@ async def select_by_label_native_or_bootstrap(p, label_text: str, option_text: s
                 await p.click(tsel)
                 opt = p.get_by_text(option_text, exact=False).first
                 await opt.click(timeout=5000)
-                # close dropdown if it stays open
                 try:
                     await p.keyboard.press("Escape")
                 except Exception:
@@ -133,7 +125,6 @@ async def select_by_label_native_or_bootstrap(p, label_text: str, option_text: s
     return False
 
 async def select_all_in_bootstrap_by_label(p, label_text: str):
-    """Special case for 'Nature Of Application' -> 'Select all' in Bootstrap-select."""
     label_text = label_text.strip()
     toggle_candidates = [
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button",
@@ -152,7 +143,6 @@ async def select_all_in_bootstrap_by_label(p, label_text: str):
                         except Exception:
                             pass
                         return True
-                # fallback: click all visible options (best-effort)
                 try:
                     items = p.locator("ul li a, ul li span").all()
                     for it in items:
@@ -170,7 +160,6 @@ async def select_all_in_bootstrap_by_label(p, label_text: str):
     return False
 
 async def wait_for_report_table(p, timeout_ms=20000):
-    """Wait for either a results table/grid or a 'No records' message."""
     try:
         await p.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
         return True
@@ -184,7 +173,6 @@ async def wait_for_report_table(p, timeout_ms=20000):
 # ───────────────────────────────────────────────────────────────────────────────
 
 async def site_login_and_download():
-    # If LOGIN_URL not provided as a secret, default to the real e-Sinchai login
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
@@ -199,9 +187,8 @@ async def site_login_and_download():
             args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
         context = await browser.new_context(accept_downloads=True)
-        # Be more patient than defaults
-        context.set_default_timeout(60000)                 # 60s for actions
-        context.set_default_navigation_timeout(180000)     # 180s for page.goto
+        context.set_default_timeout(60000)
+        context.set_default_navigation_timeout(180000)
         page = await context.new_page()
 
         # 1) Open login page
@@ -216,17 +203,16 @@ async def site_login_and_download():
         if last_err:
             raise last_err
 
-        # Screenshot: initial login page
         await page.screenshot(path=str(OUT / "step1_login_page.png"), full_page=True)
 
-        # 2) Select User Type (native <select id="usertype"> on e-SInchai)
+        # 2) Select User Type
         selected = False
         if user_type:
             log(f"Selecting user type: {user_type}")
             for sel in ["select#usertype", "select#userType", "select[name='userType']", "select#user_type"]:
                 if await page.locator(sel).count():
                     try:
-                        await page.select_option(sel, value=user_type)  # e.g., XEN
+                        await page.select_option(sel, value=user_type)
                         selected = True
                         break
                     except Exception:
@@ -249,33 +235,21 @@ async def site_login_and_download():
         log(f"Selected user type? {selected} (requested='{user_type}')")
         await page.screenshot(path=str(OUT / "after_user_type.png"), full_page=True)
 
-        # 3) Fill username & password (be tolerant with ids/names)
-        user_ok = await fill_first(
-            page,
-            [
-                "input[name='username']",
-                "#username",
-                "input[name='login']",
-                "#login",
-                "input[name='userid']",
-                "#userid",
-                "#loginid",
-                "input[name='loginid']",
-                "input[placeholder*='Email']",
-                "input[placeholder*='Mobile']",
-                "input[placeholder*='Login']",
-            ],
+        # 3) Credentials
+        user_ok = await fill_first(page,
+            ["input[name='username']", "#username", "input[name='login']", "#login",
+             "input[name='userid']", "#userid", "#loginid", "input[name='loginid']",
+             "input[placeholder*='Email']", "input[placeholder*='Mobile']", "input[placeholder*='Login']"],
             username
         )
-        pass_ok = await fill_first(
-            page,
+        pass_ok = await fill_first(page,
             ["input[name='password']", "#password", "input[name='pwd']", "#pwd", "input[placeholder='Password']"],
             password
         )
         log(f"Filled username: {user_ok}, password: {pass_ok}")
         await page.screenshot(path=str(OUT / "step2_before_login.png"), full_page=True)
 
-        # 4) Click Login
+        # 4) Login click
         clicked = await click_first(page, [
             "button:has-text('Login')",
             "button:has-text('Sign in')",
@@ -284,57 +258,85 @@ async def site_login_and_download():
         ], timeout=5000)
         log(f"Clicked login button? {clicked}")
 
-        # Wait for navigation after login (dashboard)
         await page.wait_for_load_state("networkidle", timeout=120000)
         await page.screenshot(path=str(OUT / "step3_after_login.png"), full_page=True)
         log("Login step complete.")
+        log(f"Current URL: {page.url}")
+
+        # Save DOM after login for diagnostics
+        try:
+            (OUT / "dom_after_login.html").write_text(await page.content(), encoding="utf-8")
+        except Exception:
+            pass
 
         # ───────────────────────────────────────────────────────────────────
-        # Report A: MIS Reports → Application Wise Report → filters → Show → PDF
+        # Report A flow with verbose logging
         # ───────────────────────────────────────────────────────────────────
         async def steps_A(p, save_path):
-            # 1) Open MIS Reports (left sidebar)
-            opened = await click_first(p, [
+            log("[A] Looking for 'MIS Reports' in sidebar…")
+            # quick scan of menu texts (for debugging)
+            try:
+                texts = await p.eval_on_selector_all(
+                    "nav, aside, #sidebar, .sidebar, a, li, button",
+                    """els => Array.from(els)
+                        .map(e => (e.innerText||'').trim())
+                        .filter(t => t)
+                        .slice(0,400)"""
+                )
+                (OUT / "menu_scan.txt").write_text("\n".join(texts), encoding="utf-8")
+            except Exception:
+                pass
+
+            # 1) Open MIS Reports
+            if not await click_first(p, [
                 "nav >> text=MIS Reports",
                 "text=MIS Reports",
                 "a:has-text('MIS Reports')",
                 "[role='menuitem']:has-text('MIS Reports')",
                 "button:has-text('MIS Reports')",
                 "li:has-text('MIS Reports')"
-            ], timeout=5000)
-            if not opened:
+            ], timeout=3000):
+                # fallback: wait a bit for it to appear
                 try:
-                    await p.get_by_text("MIS Reports", exact=False).hover()
+                    await p.get_by_text("MIS Reports", exact=False).wait_for(timeout=9000)
+                    await p.get_by_text("MIS Reports", exact=False).first.click()
                 except Exception:
-                    pass
-            await p.wait_for_timeout(300)
-            await p.screenshot(path=str(OUT / "after_open_mis.png"), full_page=True)
+                    await p.screenshot(path=str(OUT / "fail_find_mis_reports.png"), full_page=True)
+                    raise RuntimeError("[A] Could not find/click 'MIS Reports' (see fail_find_mis_reports.png / menu_scan.txt)")
 
-            # 2) Click Application Wise Report and wait for correct page/content
+            await p.wait_for_timeout(400)
+            await p.screenshot(path=str(OUT / "after_open_mis.png"), full_page=True)
+            log("[A] MIS Reports opened (or clicked).")
+
+            # 2) Application Wise Report
+            log("[A] Clicking 'Application Wise Report'…")
             ok = await click_first(p, [
                 "text=Application Wise Report",
                 "a:has-text('Application Wise Report')",
                 "[role='menuitem']:has-text('Application Wise Report')",
                 "li:has-text('Application Wise Report')",
-            ], timeout=8000)
+            ], timeout=5000)
             if not ok:
                 await p.screenshot(path=str(OUT / "fail_open_app_wise.png"), full_page=True)
-                raise RuntimeError("Could not open 'Application Wise Report'")
+                raise RuntimeError("[A] Could not open 'Application Wise Report'")
 
-            # Prefer URL change, fallback to content wait
+            # Prefer URL change; fallback to content wait
             try:
                 await p.wait_for_url(re.compile(r".*/Authorities/applicationwisereport\.jsp.*"), timeout=20000)
+                log("[A] URL changed to applicationwisereport.jsp")
             except Exception:
+                log("[A] URL did not change; waiting for page content text…")
                 try:
                     await p.get_by_text("Application Wise Report", exact=False).wait_for(timeout=12000)
                 except Exception:
                     await p.screenshot(path=str(OUT / "fail_wait_app_wise.png"), full_page=True)
-                    raise RuntimeError("After clicking Application Wise Report, neither URL nor content appeared in time.")
+                    raise RuntimeError("[A] After clicking Application Wise Report, neither URL nor content appeared in time.")
 
             await p.wait_for_load_state("networkidle")
             await p.screenshot(path=str(OUT / "after_open_app_wise.png"), full_page=True)
 
-            # 3) Select dropdowns in exact order
+            # 3) Filters
+            log("[A] Selecting filters…")
             ok1 = await select_by_label_native_or_bootstrap(p, "Circle Office", "LUDHIANA CANAL CIRCLE")
             ok2 = await select_by_label_native_or_bootstrap(p, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
             ok3 = await select_all_in_bootstrap_by_label(p, "Nature Of Application")
@@ -347,28 +349,33 @@ async def site_login_and_download():
                     encoding="utf-8"
                 )
                 await p.screenshot(path=str(OUT / "fail_dropdowns.png"), full_page=True)
-                raise RuntimeError("Dropdown selection failed (see dropdown_warning.txt)")
+                raise RuntimeError("[A] Dropdown selection failed (see dropdown_warning.txt)")
 
             await p.screenshot(path=str(OUT / "after_select_filters.png"), full_page=True)
+            log("[A] Filters selected.")
 
-            # 4) Click Show Report
+            # 4) Show Report
+            log("[A] Clicking 'Show Report'…")
             if not await click_first(p, [
                 "button:has-text('Show Report')",
                 "input[type='button'][value='Show Report']",
                 "text=Show Report"
-            ], timeout=8000):
+            ], timeout=6000):
                 await p.screenshot(path=str(OUT / "fail_show_report.png"), full_page=True)
-                raise RuntimeError("Show Report button not found")
+                raise RuntimeError("[A] Show Report button not found")
 
-            # 5) Wait for grid/content
+            # 5) Wait grid
+            log("[A] Waiting for report grid…")
             ok_grid = await wait_for_report_table(p, timeout_ms=20000)
             if not ok_grid:
                 (OUT / "report_timeout.txt").write_text("Report grid did not appear in 20s.", encoding="utf-8")
                 await p.screenshot(path=str(OUT / "fail_no_grid.png"), full_page=True)
-                raise RuntimeError("Report grid did not appear in time")
+                raise RuntimeError("[A] Report grid did not appear in time")
             await p.screenshot(path=str(OUT / "after_grid_shown.png"), full_page=True)
+            log("[A] Report grid is visible.")
 
-            # 6) Click the PDF export icon/button – only this click is wrapped
+            # 6) PDF
+            log("[A] Clicking PDF icon…")
             async def do_pdf_click():
                 if not await click_first(p, [
                     "a[title*='PDF']",
@@ -378,13 +385,15 @@ async def site_login_and_download():
                     "img[alt*='PDF']",
                     "button:has-text('Export PDF')",
                     "button:has-text('Download PDF')"
-                ], timeout=8000):
-                    await p.locator("a[title*='PDF'], button[title*='PDF'], img[alt*='PDF']").first.click(timeout=8000)
+                ], timeout=6000):
+                    await p.locator("a[title*='PDF'], button[title*='PDF'], img[alt*='PDF']").first.click(timeout=6000)
 
             ok_download = await click_and_wait_download(p, do_pdf_click, save_path, timeout_ms=25000)
             if not ok_download:
                 await p.screenshot(path=str(OUT / "fail_pdf_click.png"), full_page=True)
-                raise RuntimeError("Could not obtain PDF (no direct download and popup fallback failed)")
+                raise RuntimeError("[A] Could not obtain PDF (no direct download and popup fallback failed)")
+
+            log(f"[A] PDF saved → {save_path}")
 
         # Run A
         pathA = OUT / f"{nameA}_{stamp}.pdf"
