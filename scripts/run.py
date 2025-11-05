@@ -4,6 +4,10 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
+# ── load .env so USERNAME/PASSWORD/etc. are available ──────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
 BASE = Path(__file__).resolve().parent
 OUT = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
@@ -98,38 +102,58 @@ async def site_login_and_download():
         await page.screenshot(path=str(OUT / "step1_login_page.png"), full_page=True)
 
         # 2) Select User Type (native <select id="usertype"> on e-SInchai)
+        selected = False
         if user_type:
             log(f"Selecting user type: {user_type}")
-            # Try native select first
-            selected = False
             for sel in ["select#usertype", "select#userType", "select[name='userType']", "select#user_type"]:
                 if await page.locator(sel).count():
+                    # try by value first (e.g., XEN), then by visible label
+                    try:
+                        await page.select_option(sel, value=user_type)
+                        selected = True
+                        break
+                    except Exception:
+                        pass
                     try:
                         await page.select_option(sel, label=user_type)
                         selected = True
                         break
                     except Exception:
                         pass
-            # Fallback: custom dropdown (click box then option text)
             if not selected:
-                for opener in ["#userTypeDropdown", "[data-testid='user-type']", "div.select-user-type", "label:has-text('Select User Type') + *"]:
-                    if await page.locator(opener).count():
-                        try:
-                            await page.click(opener)
-                            await page.get_by_text(user_type, exact=True).click()
-                            selected = True
-                            break
-                        except Exception:
-                            pass
-            log(f"User type selected ok? {selected}")
+                # Log available options for debugging
+                try:
+                    opts = await page.eval_on_selector_all(
+                        "select, select#usertype, select#userType",
+                        "els => els.flatMap(s => Array.from(s.options).map(o => [o.value, o.textContent.trim()]))"
+                    )
+                    print("USER_TYPE options discovered:", opts, flush=True)
+                except Exception:
+                    pass
+        log(f"Selected user type? {selected} (requested='{user_type}')")
+        await page.screenshot(path=str(OUT / "after_user_type.png"), full_page=True)
 
         # 3) Fill username & password (be tolerant with ids/names)
-        user_ok = await fill_first(page,
-            ["input[name='username']", "#username", "input[name='login']", "#login", "input[name='userid']", "#userid", "#loginid", "input[name='loginid']"],
+        user_ok = await fill_first(
+            page,
+            [
+                "input[name='username']",
+                "#username",
+                "input[name='login']",
+                "#login",
+                "input[name='userid']",
+                "#userid",
+                "#loginid",
+                "input[name='loginid']",
+                "input[placeholder*='Email']",
+                "input[placeholder*='Mobile']",
+                "input[placeholder*='Login']",
+            ],
             username
         )
-        pass_ok = await fill_first(page,
-            ["input[name='password']", "#password", "input[name='pwd']", "#pwd"],
+        pass_ok = await fill_first(
+            page,
+            ["input[name='password']", "#password", "input[name='pwd']", "#pwd", "input[placeholder='Password']"],
             password
         )
         log(f"Filled username: {user_ok}, password: {pass_ok}")
@@ -187,3 +211,4 @@ if __name__ == "__main__":
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
+
