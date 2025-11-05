@@ -65,6 +65,41 @@ async def click_first(page, candidates, timeout=3000):
             pass
     return False
 
+# --- helpers for labeled <select> and waiting for results ---
+async def select_by_label(p, label_text: str, option_label: str):
+    """Pick an option from a dropdown located by its visible label text."""
+    label_text = label_text.strip()
+    option_label = option_label.strip()
+    candidates = [
+        f"label:has-text('{label_text}') + select",
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
+        f"text={label_text} >> xpath=following::select[1]",
+    ]
+    for sel in candidates:
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_label)
+                return True
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_label)
+                    return True
+                except Exception:
+                    pass
+    return False
+
+async def wait_for_report_table(p, timeout_ms=20000):
+    """Wait for either a results table or a 'No Records' style message."""
+    try:
+        await p.wait_for_selector("table, .table, .dataTable", timeout=timeout_ms, state="visible")
+        return True
+    except Exception:
+        try:
+            await p.get_by_text("No", exact=False).wait_for(timeout=2000)
+            return True
+        except Exception:
+            return False
+
 async def site_login_and_download():
     # If LOGIN_URL not provided as a secret, default to the real e-Sinchai login
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
@@ -107,9 +142,8 @@ async def site_login_and_download():
             log(f"Selecting user type: {user_type}")
             for sel in ["select#usertype", "select#userType", "select[name='userType']", "select#user_type"]:
                 if await page.locator(sel).count():
-                    # try by value first (e.g., XEN), then by visible label
                     try:
-                        await page.select_option(sel, value=user_type)
+                        await page.select_option(sel, value=user_type)  # e.g., XEN
                         selected = True
                         break
                     except Exception:
@@ -121,7 +155,6 @@ async def site_login_and_download():
                     except Exception:
                         pass
             if not selected:
-                # Log available options for debugging
                 try:
                     opts = await page.eval_on_selector_all(
                         "select, select#usertype, select#userType",
@@ -173,23 +206,84 @@ async def site_login_and_download():
         await page.screenshot(path=str(OUT / "step3_after_login.png"), full_page=True)
         log("Login step complete.")
 
-        # --------- Report A (EDIT selectors to match your site) ----------
+        # --------- Report A: MIS Reports → Application Wise Report ----------
         async def steps_A(p):
-            await p.click("text=Reports")
-            await p.click("text=Daily Report A")
-            # Add filters/date selection here if needed
-            await p.click("button:has-text('Download PDF')")
+            # 1) Open MIS Reports (click, else hover)
+            opened = await click_first(p, [
+                "text=MIS Reports",
+                "a:has-text('MIS Reports')",
+                "[role='menuitem']:has-text('MIS Reports')",
+                "button:has-text('MIS Reports')",
+                "li:has-text('MIS Reports')"
+            ], timeout=4000)
+            if not opened:
+                try:
+                    await p.get_by_text("MIS Reports", exact=False).hover()
+                except Exception:
+                    pass
+            await p.wait_for_timeout(400)
+
+            # 2) Click Application Wise Report
+            if not await click_first(p, [
+                "text=Application Wise Report",
+                "a:has-text('Application Wise Report')",
+                "[role='menuitem']:has-text('Application Wise Report')",
+                "button:has-text('Application Wise Report')",
+                "li:has-text('Application Wise Report')"
+            ], timeout=6000):
+                raise RuntimeError("Could not open 'Application Wise Report'")
+
+            # 3) Select dropdowns in exact order
+            ok1 = await select_by_label(p, "Circle Office", "LUDHIANA CANAL CIRCLE")
+            ok2 = await select_by_label(p, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
+            ok3 = await select_by_label(p, "Nature Of Application", "Select all")
+            ok4 = await select_by_label(p, "Status", "DELAYED")
+            if not all([ok1, ok2, ok3, ok4]):
+                (OUT / "dropdown_warning.txt").write_text(
+                    f"Circle:{ok1} Division:{ok2} Nature:{ok3} Status:{ok4}\n"
+                    "One or more dropdowns were not found/selected. Check labels/casing.",
+                    encoding="utf-8"
+                )
+                raise RuntimeError("One or more dropdowns could not be selected. See out/dropdown_warning.txt")
+
+            # 4) Click Show Report (green button)
+            if not await click_first(p, [
+                "button:has-text('Show Report')",
+                "input[type='button'][value='Show Report']",
+                "text=Show Report"
+            ], timeout=8000):
+                raise RuntimeError("Show Report button not found")
+
+            # 5) Wait for grid to appear
+            ready = await wait_for_report_table(p, timeout_ms=20000)
+            if not ready:
+                (OUT / "report_timeout.txt").write_text("Report grid did not appear in 20s.", encoding="utf-8")
+                raise RuntimeError("Report grid did not appear in time")
+
+            # 6) Click the PDF export icon/button
+            if not await click_first(p, [
+                "a[title*='PDF']",
+                "button[title*='PDF']",
+                "text=PDF",
+                "i.fa-file-pdf",
+                "img[alt*='PDF']",
+                "button:has-text('Export PDF')",
+                "button:has-text('Download PDF')"
+            ], timeout=8000):
+                try:
+                    await p.locator("a[title*='PDF'], button[title*='PDF']").first.click(timeout=8000)
+                except Exception:
+                    raise RuntimeError("PDF download control not found")
 
         pathA = OUT / f"{nameA}_{stamp}.pdf"
         await download_report(page, steps_A, pathA)
         log(f"Saved {pathA.name}")
 
-        # --------- Report B (EDIT selectors to match your site) ----------
+        # --------- Report B (temporarily reuse A's flow or customize later) ----------
         async def steps_B(p):
-            await p.click("text=Reports")
-            await p.click("text=Daily Report B")
-            # Add filters/date selection here if needed
-            await p.click("button:has-text('Download PDF')")
+            # If Report B is different, duplicate steps_A with the right menu/filters.
+            # For now, reuse the same flow to download again (or you can comment this out).
+            await steps_A(p)
 
         pathB = OUT / f"{nameB}_{stamp}.pdf"
         await download_report(page, steps_B, pathB)
@@ -211,4 +305,3 @@ if __name__ == "__main__":
     except Exception as e:
         traceback.print_exc()
         sys.exit(1)
-
