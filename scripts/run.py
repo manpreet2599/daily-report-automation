@@ -67,7 +67,6 @@ async def click_first(page, candidates, timeout=3000):
         except Exception: pass
     return False
 
-# --- debug near label
 async def _dump_near(p, label_text: str, tag: str):
     try:
         html = await p.evaluate(
@@ -82,26 +81,22 @@ async def _dump_near(p, label_text: str, tag: str):
 
 # --- read displayed value near label (bootstrap/native) ---
 async def read_display_value_near_label(p, label_text: str):
-    """
-    Returns the visible text on the Bootstrap-select toggle next to label,
-    or the selected <option> text from a native <select>. Never throws.
-    """
+    """Returns visible text on bootstrap toggle or selected option on native <select> near a label."""
     try:
         txt = await p.evaluate(
             """(labelText) => {
+                const norm = s => (s||'').trim().toLowerCase();
                 const label = Array.from(document.querySelectorAll('label'))
-                  .find(l => (l.textContent||'').trim().toLowerCase().includes(labelText.toLowerCase()));
+                  .find(l => norm(l.textContent).includes(norm(labelText)));
                 if (!label) return null;
                 const root = label.closest('div') || label.parentElement || document.body;
 
-                // Bootstrap-select button text
                 const btn = root.querySelector('.bootstrap-select .dropdown-toggle, button.dropdown-toggle');
                 if (btn) {
                   const inner = btn.querySelector('.filter-option-inner-inner') || btn;
                   const t = (inner.textContent || '').trim();
                   if (t) return t;
                 }
-                // Native select selected option
                 const sel = root.querySelector('select');
                 if (sel && sel.selectedIndex >= 0) {
                   const opt = sel.options[sel.selectedIndex];
@@ -115,8 +110,8 @@ async def read_display_value_near_label(p, label_text: str):
     except Exception:
         return ""
 
-# --- selection internals ---
-async def _wait_option_on_select(p, select_css: str, option_text: str, timeout_ms=15000):
+# --- select helpers (native / bootstrap) ---
+async def _wait_option_on_select(p, select_css: str, option_text: str, timeout_ms=20000):
     end = asyncio.get_event_loop().time() + (timeout_ms/1000)
     while asyncio.get_event_loop().time() < end:
         try:
@@ -129,7 +124,7 @@ async def _wait_option_on_select(p, select_css: str, option_text: str, timeout_m
     return False
 
 async def _native_select(p, label_text: str, id_candidates, name_candidates, option_text: str):
-    # try by label->select
+    # try label → select
     label_based = [
         f"label:has-text('{label_text}') + select",
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
@@ -165,7 +160,6 @@ async def _native_select(p, label_text: str, id_candidates, name_candidates, opt
     return False, None
 
 async def _bootstrap_select(p, label_text: str, option_text: str):
-    # open toggle near label and select item from .dropdown-menu.show
     toggle_candidates = [
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]",
         f"label:has-text('{label_text}') + * button.dropdown-toggle",
@@ -188,9 +182,9 @@ async def _bootstrap_select(p, label_text: str, option_text: str):
                         await candidate.click(timeout=5000, force=True)
                         found = True
                         break
-                    try:
-                        await menu.evaluate("(m)=>m.scrollBy(0,200)")
+                    try: await menu.evaluate("(m)=>m.scrollBy(0,200)")
                     except Exception: pass
+
                 try: await p.keyboard.press("Escape")
                 except Exception: pass
                 if found: return True
@@ -229,7 +223,7 @@ async def select_division(p, option_text: str):
         if await p.locator(sel).count():
             if await _wait_option_on_select(p, sel, option_text, timeout_ms=20000):
                 try:
-                    await p.select_option(sel, label=option_text); 
+                    await p.select_option(sel, label=option_text)
                     await p.screenshot(path=str(OUT / "after_select_division.png"), full_page=True)
                     (OUT / "selected_division.txt").write_text(f"via native: {sel}", encoding="utf-8")
                     return True
@@ -247,59 +241,58 @@ async def select_division(p, option_text: str):
     return ok
 
 async def select_nature_all(p):
-    log(f"[filter] Nature Of Application → Select all")
-    toggle_candidates = [
-        f"xpath=//label[contains(normalize-space(), 'Nature Of Application')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]",
-        "label:has-text('Nature Of Application') + * button.dropdown-toggle"
-    ]
-    for tsel in toggle_candidates:
-        if await p.locator(tsel).count():
-            try:
-                btn = p.locator(tsel).first
-                await btn.scroll_into_view_if_needed()
-                await btn.click()
-                menu = p.locator(".dropdown-menu.show, .show .dropdown-menu").first
-                await menu.wait_for(timeout=5000)
-                for txt in ["Select all", "Select All", "All selected", "All Selected"]:
-                    node = menu.locator("li, a, span, .text, button").filter(has_text=txt).first
-                    if await node.count():
-                        await node.scroll_into_view_if_needed()
-                        await node.click(timeout=5000, force=True)
-                        try: await p.keyboard.press("Escape")
-                        except Exception: pass
-                        await p.screenshot(path=str(OUT / "after_select_nature.png"), full_page=True)
-                        return True
-                # fallback: click all visible options
-                try:
-                    for it in menu.locator("li a, li span, li .text").all():
-                        try:
-                            if await it.is_visible():
-                                await it.click()
-                        except Exception: pass
-                    try: await p.keyboard.press("Escape")
-                    except Exception: pass
-                    await p.screenshot(path=str(OUT / "after_select_nature.png"), full_page=True)
-                    return True
-                except Exception: pass
-            except Exception: pass
-    # native multi-select fallback
-    native = [
-        "label:has-text('Nature Of Application') + select",
-        "xpath=//label[contains(normalize-space(),'Nature Of Application')']/following::select[1]"
-    ]
-    for sel in native:
-        if await p.locator(sel).count():
-            try:
-                await p.evaluate("""(css)=>{
-                    const s=document.querySelector(css); if(!s) return;
-                    for (const o of s.options){ o.selected=true; }
-                    s.dispatchEvent(new Event('change',{bubbles:true}));
-                }""", sel)
-                await p.screenshot(path=str(OUT / "after_select_nature.png"), full_page=True)
-                return True
-            except Exception: pass
-    await _dump_near(p, "Nature Of Application", "nature")
-    return False
+    """
+    Nature Of Application → Select all (robust).
+    Finds the <select> tied to the label, selects all options, dispatches events.
+    """
+    log(f"[filter] Nature Of Application → Select all (force)")
+    js = """
+    (labelText) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(document.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes(norm(labelText)));
+      if (!L) return { ok:false, reason:'label not found' };
+
+      const root = L.closest('div') || L.parentElement || document.body;
+      let sel = root.querySelector('select');
+      if (!sel) {
+        sel = (L.nextElementSibling && L.nextElementSibling.matches('select')) ? L.nextElementSibling : null;
+        if (!sel) {
+          const candidates = Array.from(root.querySelectorAll('select'));
+          sel = candidates.length ? candidates[0] : null;
+        }
+      }
+      if (!sel) return { ok:false, reason:'select not found' };
+
+      let changed = false;
+      for (const o of sel.options) {
+        if (!o.selected) { o.selected = true; changed = true; }
+      }
+      if (changed) {
+        sel.dispatchEvent(new Event('input',  { bubbles:true }));
+        sel.dispatchEvent(new Event('change', { bubbles:true }));
+      }
+
+      let visible = '';
+      const btn = root.querySelector('.bootstrap-select .dropdown-toggle, button.dropdown-toggle');
+      if (btn) {
+        const inner = btn.querySelector('.filter-option-inner-inner') || btn;
+        visible = (inner.textContent || '').trim();
+      } else if (sel && sel.selectedOptions && sel.selectedOptions.length) {
+        visible = Array.from(sel.selectedOptions).map(o => (o.textContent||'').trim()).join(', ');
+      }
+      return { ok:true, visible };
+    }
+    """
+    try:
+        res = await p.evaluate(js, "Nature Of Application")
+        (OUT / "seen_nature.txt").write_text((res.get("visible") or ""), encoding="utf-8")
+        await p.screenshot(path=str(OUT / "after_select_nature.png"), full_page=True)
+        return bool(res.get("ok"))
+    except Exception as e:
+        (OUT / "seen_nature.txt").write_text(f"error: {e}", encoding="utf-8")
+        await p.screenshot(path=str(OUT / "fail_nature.png"), full_page=True)
+        return False
 
 async def select_status(p, option_text: str):
     log(f"[filter] Status → {option_text}")
@@ -342,7 +335,7 @@ async def site_login_and_download():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
         context = await browser.new_context(accept_downloads=True)
-        # slightly more generous timeouts
+        # patient timeouts
         context.set_default_timeout(90000)                 # actions: 90s
         context.set_default_navigation_timeout(240000)     # nav: 4 min
         page = await context.new_page()
@@ -429,7 +422,7 @@ async def site_login_and_download():
             await p.wait_for_load_state("networkidle")
             await p.screenshot(path=str(OUT / "after_open_app_wise.png"), full_page=True)
 
-            # --- Filters (robust, plus read displayed values) ---
+            # --- Filters (robust) ---
             log("[A] Selecting filters…")
             ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
             await p.wait_for_timeout(400)
@@ -451,10 +444,9 @@ async def site_login_and_download():
             status_seen = await read_display_value_near_label(p, "Status")
             (OUT / "seen_status.txt").write_text(status_seen or "", encoding="utf-8")
 
-            # log but continue even if flags are False
             warning_text = (f"Circle:{ok1} Division:{ok2} NatureAll:{ok3} Status:{ok4}\n"
                             f"Seen -> Circle:'{circle_seen}' Division:'{division_seen}' Nature:'{nature_seen}' Status:'{status_seen}'\n"
-                            "Flags may be False due to Bootstrap-select; proceeding to Show Report.")
+                            "Proceeding to Show Report.")
             (OUT / "dropdown_warning.txt").write_text(warning_text, encoding="utf-8")
             log(f"[A] WARNING: {warning_text}")
 
@@ -498,17 +490,13 @@ async def site_login_and_download():
                 "button:has-text('Export PDF')","button:has-text('Download PDF')",
                 "i.fa-file-pdf","img[alt*='PDF']",
             ]
-            found_any = False
-            for sel in pdf_targets:
-                if await p.locator(sel).count():
-                    found_any = True; break
+            found_any = any([await p.locator(sel).count() for sel in pdf_targets])
             if not found_any:
                 await p.screenshot(path=str(OUT / "fail_find_pdf.png"), full_page=True)
                 raise RuntimeError("[A] No PDF control found on the page")
 
             async def do_pdf_click():
-                try:
-                    await p.evaluate("window.scrollTo(0,0)")
+                try: await p.evaluate("window.scrollTo(0,0)")
                 except Exception: pass
                 for sel in pdf_targets:
                     try:
