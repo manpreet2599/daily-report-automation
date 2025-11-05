@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback
+import os, sys, asyncio, traceback, re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -108,7 +108,6 @@ async def select_by_label_native_or_bootstrap(p, label_text: str, option_text: s
                     pass
 
     # Bootstrap-select style fallback:
-    # find the toggle button next to the label and pick the option in the open menu
     toggle_candidates = [
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button",
         f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[self::button or self::*[contains(@class,'dropdown-toggle')]][1]",
@@ -118,13 +117,15 @@ async def select_by_label_native_or_bootstrap(p, label_text: str, option_text: s
         if await p.locator(tsel).count():
             try:
                 await p.click(tsel)
-                # Option can be inside a <ul role="listbox"> or similar
                 opt = p.get_by_text(option_text, exact=False).first
-                # restrict to visible and near the dropdown if needed
                 await opt.click(timeout=5000)
+                # close dropdown if it stays open
+                try:
+                    await p.keyboard.press("Escape")
+                except Exception:
+                    pass
                 return True
             except Exception:
-                # try closing and continue
                 try:
                     await p.keyboard.press("Escape")
                 except Exception:
@@ -142,26 +143,24 @@ async def select_all_in_bootstrap_by_label(p, label_text: str):
         if await p.locator(tsel).count():
             try:
                 await p.click(tsel)
-                # try 'Select all' / 'Select All'
-                for txt in ["Select all", "Select All", "Select All (", "All selected", "All Selected"]:
+                for txt in ["Select all", "Select All", "All selected", "All Selected"]:
                     el = p.get_by_text(txt, exact=False).first
                     if await el.count():
                         await el.click(timeout=5000)
-                        # close the dropdown
                         try:
                             await p.keyboard.press("Escape")
                         except Exception:
                             pass
                         return True
-                # fallback: pick all visible list items
+                # fallback: click all visible options (best-effort)
                 try:
-                    items = p.locator("ul li a, ul li span").filter(has_text="").all()
+                    items = p.locator("ul li a, ul li span").all()
                     for it in items:
-                        if await it.is_visible():
-                            try:
+                        try:
+                            if await it.is_visible():
                                 await it.click()
-                            except Exception:
-                                pass
+                        except Exception:
+                            pass
                     await p.keyboard.press("Escape")
                     return True
                 except Exception:
@@ -311,17 +310,26 @@ async def site_login_and_download():
             await p.wait_for_timeout(300)
             await p.screenshot(path=str(OUT / "after_open_mis.png"), full_page=True)
 
-            # 2) Click Application Wise Report and wait for correct page
-            with p.expect_navigation(url_regex=r".*/Authorities/applicationwisereport\.jsp.*", timeout=20000):
-                ok = await click_first(p, [
-                    "text=Application Wise Report",
-                    "a:has-text('Application Wise Report')",
-                    "[role='menuitem']:has-text('Application Wise Report')",
-                    "li:has-text('Application Wise Report')",
-                ], timeout=8000)
-                if not ok:
-                    await p.screenshot(path=str(OUT / "fail_open_app_wise.png"), full_page=True)
-                    raise RuntimeError("Could not open 'Application Wise Report'")
+            # 2) Click Application Wise Report and wait for correct page/content
+            ok = await click_first(p, [
+                "text=Application Wise Report",
+                "a:has-text('Application Wise Report')",
+                "[role='menuitem']:has-text('Application Wise Report')",
+                "li:has-text('Application Wise Report')",
+            ], timeout=8000)
+            if not ok:
+                await p.screenshot(path=str(OUT / "fail_open_app_wise.png"), full_page=True)
+                raise RuntimeError("Could not open 'Application Wise Report'")
+
+            # Prefer URL change, fallback to content wait
+            try:
+                await p.wait_for_url(re.compile(r".*/Authorities/applicationwisereport\.jsp.*"), timeout=20000)
+            except Exception:
+                try:
+                    await p.get_by_text("Application Wise Report", exact=False).wait_for(timeout=12000)
+                except Exception:
+                    await p.screenshot(path=str(OUT / "fail_wait_app_wise.png"), full_page=True)
+                    raise RuntimeError("After clicking Application Wise Report, neither URL nor content appeared in time.")
 
             await p.wait_for_load_state("networkidle")
             await p.screenshot(path=str(OUT / "after_open_app_wise.png"), full_page=True)
@@ -329,7 +337,6 @@ async def site_login_and_download():
             # 3) Select dropdowns in exact order
             ok1 = await select_by_label_native_or_bootstrap(p, "Circle Office", "LUDHIANA CANAL CIRCLE")
             ok2 = await select_by_label_native_or_bootstrap(p, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            # Nature Of Application uses 'Select all'
             ok3 = await select_all_in_bootstrap_by_label(p, "Nature Of Application")
             ok4 = await select_by_label_native_or_bootstrap(p, "Status", "DELAYED")
 
@@ -363,7 +370,6 @@ async def site_login_and_download():
 
             # 6) Click the PDF export icon/button – only this click is wrapped
             async def do_pdf_click():
-                # try several likely controls
                 if not await click_first(p, [
                     "a[title*='PDF']",
                     "button[title*='PDF']",
