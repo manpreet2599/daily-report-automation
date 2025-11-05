@@ -20,12 +20,45 @@ def today_str():
 def log(msg):
     print(msg, flush=True)
 
-async def download_report(page, nav_steps, save_as_path):
-    async with page.expect_download() as dl_info:
-        await nav_steps(page)
-    dl = await dl_info.value
-    await dl.save_as(save_as_path)
-    return save_as_path
+# ───────────────────────────────────────────────────────────────────────────────
+# A) SAFE PDF DOWNLOAD HELPER (replaces the old download_report)
+# ───────────────────────────────────────────────────────────────────────────────
+async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=20000):
+    """
+    Click a control that should trigger a PDF download.
+    If no download event fires, try a popup fallback (viewer window), and grab the PDF from there.
+    """
+    try:
+        async with p.expect_download(timeout=timeout_ms) as dl_info:
+            await click_pdf()
+        dl = await dl_info.value
+        await dl.save_as(save_as_path)
+        return True
+    except Exception as e:
+        print(f"[warn] No direct download detected ({e}). Trying popup fallback...", flush=True)
+        try:
+            async with p.expect_popup(timeout=5000) as pop_info:
+                await click_pdf()
+            pop = await pop_info.value
+            await pop.wait_for_load_state("load")
+
+            # Try to find a direct PDF link in the popup
+            link = pop.locator("a[href$='.pdf'], a[download], a[href*='application/pdf']").first
+            if await link.count():
+                async with pop.expect_download(timeout=timeout_ms) as dl_info2:
+                    await link.click()
+                dl2 = await dl_info2.value
+                await dl2.save_as(save_as_path)
+                await pop.close()
+                return True
+
+            # Last resort: screenshot the popup for debugging
+            await pop.screenshot(path=str(OUT / "popup_after_pdf_click.png"), full_page=True)
+            await pop.close()
+            return False
+        except Exception as e2:
+            print(f"[err] Popup fallback also failed: {e2}", flush=True)
+            return False
 
 async def send_via_telegram(files):
     bot = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -91,7 +124,7 @@ async def select_by_label(p, label_text: str, option_label: str):
 async def wait_for_report_table(p, timeout_ms=20000):
     """Wait for either a results table or a 'No Records' style message."""
     try:
-        await p.wait_for_selector("table, .table, .dataTable", timeout=timeout_ms, state="visible")
+        await p.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
         return True
     except Exception:
         try:
@@ -206,8 +239,10 @@ async def site_login_and_download():
         await page.screenshot(path=str(OUT / "step3_after_login.png"), full_page=True)
         log("Login step complete.")
 
-        # --------- Report A: MIS Reports → Application Wise Report ----------
-        async def steps_A(p):
+        # ───────────────────────────────────────────────────────────────────
+        # B) NEW steps_A: MIS Reports → Application Wise Report → PDF download
+        # ───────────────────────────────────────────────────────────────────
+        async def steps_A(p, save_path):
             # 1) Open MIS Reports (click, else hover)
             opened = await click_first(p, [
                 "text=MIS Reports",
@@ -231,6 +266,7 @@ async def site_login_and_download():
                 "button:has-text('Application Wise Report')",
                 "li:has-text('Application Wise Report')"
             ], timeout=6000):
+                await p.screenshot(path=str(OUT / "fail_open_app_wise.png"), full_page=True)
                 raise RuntimeError("Could not open 'Application Wise Report'")
 
             # 3) Select dropdowns in exact order
@@ -244,6 +280,7 @@ async def site_login_and_download():
                     "One or more dropdowns were not found/selected. Check labels/casing.",
                     encoding="utf-8"
                 )
+                await p.screenshot(path=str(OUT / "fail_dropdowns.png"), full_page=True)
                 raise RuntimeError("One or more dropdowns could not be selected. See out/dropdown_warning.txt")
 
             # 4) Click Show Report (green button)
@@ -252,41 +289,45 @@ async def site_login_and_download():
                 "input[type='button'][value='Show Report']",
                 "text=Show Report"
             ], timeout=8000):
+                await p.screenshot(path=str(OUT / "fail_show_report.png"), full_page=True)
                 raise RuntimeError("Show Report button not found")
 
-            # 5) Wait for grid to appear
-            ready = await wait_for_report_table(p, timeout_ms=20000)
-            if not ready:
+            # 5) Wait for grid/content
+            try:
+                await p.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=20000, state="visible")
+            except Exception:
                 (OUT / "report_timeout.txt").write_text("Report grid did not appear in 20s.", encoding="utf-8")
-                raise RuntimeError("Report grid did not appear in time")
+                await p.screenshot(path=str(OUT / "fail_no_grid.png"), full_page=True)
+                raise
 
-            # 6) Click the PDF export icon/button
-            if not await click_first(p, [
-                "a[title*='PDF']",
-                "button[title*='PDF']",
-                "text=PDF",
-                "i.fa-file-pdf",
-                "img[alt*='PDF']",
-                "button:has-text('Export PDF')",
-                "button:has-text('Download PDF')"
-            ], timeout=8000):
-                try:
+            # 6) Click the PDF export icon/button – only this click is wrapped
+            async def do_pdf_click():
+                # try several common PDF controls
+                if not await click_first(p, [
+                    "a[title*='PDF']",
+                    "button[title*='PDF']",
+                    "text=PDF",
+                    "i.fa-file-pdf",
+                    "img[alt*='PDF']",
+                    "button:has-text('Export PDF')",
+                    "button:has-text('Download PDF')"
+                ], timeout=8000):
+                    # try the first control in a toolbar
                     await p.locator("a[title*='PDF'], button[title*='PDF']").first.click(timeout=8000)
-                except Exception:
-                    raise RuntimeError("PDF download control not found")
 
+            ok = await click_and_wait_download(p, do_pdf_click, save_path, timeout_ms=25000)
+            if not ok:
+                raise RuntimeError("Could not obtain PDF (neither direct download nor popup method worked)")
+
+        # ───────────────────────────────────────────────────────────────────
+        # C) Call steps_A twice (for A and B). Customize steps_B later as needed.
+        # ───────────────────────────────────────────────────────────────────
         pathA = OUT / f"{nameA}_{stamp}.pdf"
-        await download_report(page, steps_A, pathA)
+        await steps_A(page, pathA)
         log(f"Saved {pathA.name}")
 
-        # --------- Report B (temporarily reuse A's flow or customize later) ----------
-        async def steps_B(p):
-            # If Report B is different, duplicate steps_A with the right menu/filters.
-            # For now, reuse the same flow to download again (or you can comment this out).
-            await steps_A(p)
-
         pathB = OUT / f"{nameB}_{stamp}.pdf"
-        await download_report(page, steps_B, pathB)
+        await steps_A(page, pathB)  # reuse for now; replace with your B flow later
         log(f"Saved {pathB.name}")
 
         await context.close()
