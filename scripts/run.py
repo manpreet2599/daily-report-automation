@@ -120,7 +120,7 @@ async def _wait_option_on_select(p, select_css: str, option_text: str, timeout_m
                 return True
         except Exception:
             pass
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(0.1)
     return False
 
 async def _native_select(p, label_text: str, id_candidates, name_candidates, option_text: str):
@@ -175,14 +175,14 @@ async def _bootstrap_select(p, label_text: str, option_text: str):
                 await menu.wait_for(timeout=5000)
 
                 found = False
-                for _ in range(15):
+                for _ in range(20):
                     candidate = menu.locator("li, a, span, .text").filter(has_text=option_text).first
                     if await candidate.count():
                         await candidate.scroll_into_view_if_needed()
                         await candidate.click(timeout=5000, force=True)
                         found = True
                         break
-                    try: await menu.evaluate("(m)=>m.scrollBy(0,200)")
+                    try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
                     except Exception: pass
 
                 try: await p.keyboard.press("Escape")
@@ -211,30 +211,55 @@ async def select_circle(p, option_text: str):
     await p.screenshot(path=str(OUT / "after_select_circle.png"), full_page=True)
     return ok
 
+# ⚡ Fast, reactive Division selection (tight loops, no long waits)
 async def select_division(p, option_text: str):
     log(f"[filter] Division Office → {option_text}")
-    possible_sel = [
-        "select#division", "select#divisionId", "select#divisionOffice",
-        "select[name='division']", "select[name*='division']",
+
+    # Find native select near label
+    label_selects = [
         "label:has-text('Division Office') + select",
         "xpath=//label[contains(normalize-space(),'Division Office')]/following::select[1]"
     ]
-    for sel in possible_sel:
-        if await p.locator(sel).count():
-            if await _wait_option_on_select(p, sel, option_text, timeout_ms=20000):
-                try:
-                    await p.select_option(sel, label=option_text)
-                    await p.screenshot(path=str(OUT / "after_select_division.png"), full_page=True)
-                    (OUT / "selected_division.txt").write_text(f"via native: {sel}", encoding="utf-8")
-                    return True
-                except Exception:
+    native_sel = None
+    for css in label_selects:
+        if await p.locator(css).count():
+            native_sel = css
+            break
+    if not native_sel:
+        # fallback: common ids/names
+        for css in ["select#division","select#divisionId","select#divisionOffice",
+                    "select[name='division']","select[name*='division']"]:
+            if await p.locator(css).count():
+                native_sel = css
+                break
+
+    if native_sel:
+        # wait until enabled (max ~3s)
+        for _ in range(30):
+            try:
+                disabled = await p.eval_on_selector(native_sel, "s => s.disabled")
+                if not disabled:
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+
+        # wait until our option appears (max ~6s)
+        for _ in range(60):
+            try:
+                if await p.locator(f"{native_sel} >> option", has_text=option_text).count():
                     try:
-                        await p.select_option(sel, value=option_text)
-                        await p.screenshot(path=str(OUT / "after_select_division.png"), full_page=True)
-                        (OUT / "selected_division.txt").write_text(f"via native(value): {sel}", encoding="utf-8")
-                        return True
+                        await p.select_option(native_sel, label=option_text)
                     except Exception:
-                        pass
+                        await p.select_option(native_sel, value=option_text)
+                    await p.screenshot(path=str(OUT / "after_select_division.png"), full_page=True)
+                    (OUT / "selected_division.txt").write_text(f"via native: {native_sel}", encoding="utf-8")
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+
+    # Bootstrap-select fallback (fast)
     ok = await _bootstrap_select(p, "Division Office", option_text)
     await _dump_near(p, "Division Office", "division")
     await p.screenshot(path=str(OUT / "after_select_division.png"), full_page=True)
@@ -333,11 +358,41 @@ async def site_login_and_download():
     stamp       = today_str()
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-breakpad",
+                "--disable-client-side-phishing-detection",
+                "--disable-default-apps",
+                "--disable-hang-monitor",
+                "--disable-ipc-flooding-protection",
+                "--disable-popup-blocking",
+                "--disable-prompt-on-repost",
+                "--metrics-recording-only",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
+            ]
+        )
         context = await browser.new_context(accept_downloads=True)
-        # patient timeouts
-        context.set_default_timeout(90000)                 # actions: 90s
-        context.set_default_navigation_timeout(240000)     # nav: 4 min
+
+        # 🚀 Speedup: block heavy resources (images, fonts, CSS)
+        async def speed_filter(route, request):
+            rtype = request.resource_type
+            if rtype in ("image", "stylesheet", "font"):
+                await route.abort()
+            else:
+                await route.continue_()
+        await context.route("**/*", speed_filter)
+
+        # patient but not too long timeouts
+        context.set_default_timeout(45000)               # actions: 45s
+        context.set_default_navigation_timeout(120000)   # nav: 2 min
+
         page = await context.new_page()
 
         log(f"Opening login page: {login_url}")
@@ -397,7 +452,7 @@ async def site_login_and_download():
                 except Exception:
                     await p.screenshot(path=str(OUT / "fail_find_mis_reports.png"), full_page=True)
                     raise RuntimeError("[A] Could not click 'MIS Reports'")
-            await p.wait_for_timeout(400)
+            await p.wait_for_timeout(200)
             await p.screenshot(path=str(OUT / "after_open_mis.png"), full_page=True)
 
             log("[A] Clicking 'Application Wise Report'…")
@@ -422,25 +477,25 @@ async def site_login_and_download():
             await p.wait_for_load_state("networkidle")
             await p.screenshot(path=str(OUT / "after_open_app_wise.png"), full_page=True)
 
-            # --- Filters (robust) ---
+            # --- Filters (fast + robust) ---
             log("[A] Selecting filters…")
             ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
-            await p.wait_for_timeout(400)
+            await p.wait_for_timeout(250)
             circle_seen = await read_display_value_near_label(p, "Circle Office")
             (OUT / "seen_circle.txt").write_text(circle_seen or "", encoding="utf-8")
 
             ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            await p.wait_for_timeout(400)
+            await p.wait_for_timeout(200)
             division_seen = await read_display_value_near_label(p, "Division Office")
             (OUT / "seen_division.txt").write_text(division_seen or "", encoding="utf-8")
 
             ok3 = await select_nature_all(p)
-            await p.wait_for_timeout(300)
+            await p.wait_for_timeout(150)
             nature_seen = await read_display_value_near_label(p, "Nature Of Application")
             (OUT / "seen_nature.txt").write_text(nature_seen or "", encoding="utf-8")
 
             ok4 = await select_status(p, "DELAYED")
-            await p.wait_for_timeout(300)
+            await p.wait_for_timeout(150)
             status_seen = await read_display_value_near_label(p, "Status")
             (OUT / "seen_status.txt").write_text(status_seen or "", encoding="utf-8")
 
@@ -453,7 +508,7 @@ async def site_login_and_download():
             await p.screenshot(path=str(OUT / "after_select_filters.png"), full_page=True)
             log("[A] Filters selected.")
 
-            # 4) Show Report (robust)
+            # Show Report
             log("[A] Clicking 'Show Report'…")
             try:
                 btn = p.locator("button:has-text('Show Report'), input[type='button'][value='Show Report']").first
@@ -482,7 +537,7 @@ async def site_login_and_download():
             await p.screenshot(path=str(OUT / "after_grid_shown.png"), full_page=True)
             log("[A] Report grid is visible.")
 
-            # 5) PDF
+            # PDF
             log("[A] Looking for PDF control…")
             pdf_targets = [
                 "a[title*='PDF']","button[title*='PDF']","button.buttons-pdf",
