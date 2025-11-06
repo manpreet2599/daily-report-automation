@@ -224,7 +224,93 @@ async def select_option_any(panel, page, label_text: str, option_text: str) -> b
     log(f"[filter] {label_text} FAILED to set '{option_text}' (all methods).")
     return False
 
-# ====== NEW: wait until an option text exists in ANY select (for dependent dropdowns) ======
+# ====== NEW: multi-select helper for "Nature Of Application" ======
+async def bs_select_all_if_present(panel, page, label_text: str) -> bool:
+    """
+    For multi-selects (e.g., Nature Of Application), click "Select All" if present.
+    Panel scope → page scope → native all.
+    """
+    async def try_in_root(root) -> bool:
+        btn = await _bs_find_toggle_in_root(root, label_text)
+        if not await btn.count():
+            return False
+        await btn.scroll_into_view_if_needed()
+        await btn.click(timeout=6000)
+        menu = page.locator(".dropdown-menu.show, .show .dropdown-menu").first
+        try:
+            await menu.wait_for(timeout=4000)
+        except Exception:
+            await _bs_close_dropdown(page)
+            return False
+
+        sel_all = menu.locator("li, a, span, .text").filter(has_text=re.compile(r"select\s*all", re.I)).first
+        if await sel_all.count():
+            await sel_all.click(timeout=5000, force=True)
+            await _bs_close_dropdown(page)
+            log(f"[filter] {label_text} → Select All (bootstrap)")
+            return True
+
+        # else click first few visible items (fallback)
+        clicked = False
+        try:
+            vis = menu.locator("li:not(.disabled) a, li:not(.disabled) .text")
+            count = await vis.count()
+            for i in range(min(count, 20)):
+                it = vis.nth(i)
+                try:
+                    await it.click(timeout=800)
+                    clicked = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        await _bs_close_dropdown(page)
+        if clicked:
+            log(f"[filter] {label_text} → selected multiple (bootstrap)")
+            return True
+        return False
+
+    # panel then page
+    if await try_in_root(panel): return True
+    if await try_in_root(page): return True
+
+    # native select-all
+    try:
+        ok = await panel.evaluate("""
+          (root, labelText) => {
+            const norm = s => (s||'').trim().toLowerCase();
+            let label = Array.from(root.querySelectorAll('label'))
+              .find(l => norm(l.textContent).includes(norm(labelText)));
+            let sel = null;
+            if (label) {
+              const forId = label.getAttribute('for');
+              if (forId) sel = root.querySelector('#'+CSS.escape(forId));
+              if (!sel) {
+                sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
+                  ? label.nextElementSibling
+                  : (label.closest('div') || root).querySelector('select');
+              }
+            } else {
+              sel = root.querySelector('select');
+            }
+            if (!sel) return false;
+            let changed = false;
+            for (const o of sel.options) { if (!o.selected) { o.selected = true; changed = true; } }
+            if (changed) {
+              sel.dispatchEvent(new Event('input',{bubbles:true}));
+              sel.dispatchEvent(new Event('change',{bubbles:true}));
+            }
+            return true;
+          }
+        """, label_text)
+        if ok:
+            log(f"[filter] {label_text} → Select All (native)")
+            return True
+    except Exception:
+        pass
+    return False
+
+# ====== Wait for dependent Division after Circle ======
 async def wait_until_option_exists_any_select(page, option_text: str, timeout_ms: int = 20000) -> bool:
     deadline = time.time() + timeout_ms/1000
     while time.time() < deadline:
@@ -248,9 +334,7 @@ async def wait_until_option_exists_any_select(page, option_text: str, timeout_ms
         await asyncio.sleep(0.2)
     return False
 
-# A convenience: wait for fetch/XHR hint + the option to show up
 async def wait_division_options_after_circle(page, target_division_text: str, max_wait_ms: int = 20000):
-    # try to catch a division-related network response while polling the DOM
     async def wait_response():
         try:
             await page.wait_for_response(
@@ -417,7 +501,7 @@ class RequestSniffer:
                 url_l = (ev.get("url") or "").lower()
                 h = {k.lower():v for k,v in (ev.get("headers") or {}).items()}
                 ctype = h.get("content-type","").lower()
-                if "pdf" in ctype or any(x in url_l for x in ("pdf","export","download","report")):
+                if "pdf" in ctype or any(x in ctype for x in ("application/pdf",)) or any(x in url_l for x in ("pdf","export","download","report")):
                     cand_resp = ev
                     break
         if not cand_resp:
@@ -674,7 +758,6 @@ async def site_login_and_download():
             log("[wait] Waiting for Division list to populate after Circle…")
             await wait_division_options_after_circle(page, target_division_text=target_div, max_wait_ms=25000)
 
-            # try selection again (now that options are present)
             if not await select_option_any(panel, page, "Division Office", target_div):
                 # last-chance: directly pick the option where it exists
                 picked = await page.evaluate("""
@@ -767,4 +850,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         traceback.print_exc(); sys.exit(1)
-
