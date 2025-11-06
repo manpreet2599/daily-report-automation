@@ -17,11 +17,11 @@ def today_str():
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist).strftime("%d-%m-%Y")
 
-def log(msg): 
+def log(msg):
     print(msg, flush=True)
 
 async def snap(page, name, full=False):
-    if not DEBUG: 
+    if not DEBUG:
         return
     try:
         await page.screenshot(path=str(OUT / name), full_page=bool(full))
@@ -31,7 +31,6 @@ async def snap(page, name, full=False):
 # ===================== FAST PANEL BINDING =====================
 
 async def get_app_panel(page):
-    # Resolve once, then reuse the element handle for speed.
     panel = page.locator("xpath=//div[.//text()[contains(.,'Application Wise Report')]]").first
     await panel.wait_for(state="visible", timeout=10000)
     return panel
@@ -39,14 +38,17 @@ async def get_app_panel(page):
 # ===================== FAST SELECT/INPUT OPS (PANEL-SCOPED) =====================
 
 FAST_SELECT_JS = """
-(root, labelText, wanted) => {
+(root, args) => {
+  const { labelText, wanted } = args;
   const norm = s => (s||'').trim().toLowerCase();
   const wantedNorm = norm(wanted);
-  // 1) find label
+
+  // find label inside this panel
   let label = Array.from(root.querySelectorAll('label'))
       .find(l => norm(l.textContent).includes(norm(labelText)));
   if (!label) return {ok:false, reason:'label not found'};
-  // 2) find associated select
+
+  // find associated select inside the same area
   let sel = null;
   const forId = label.getAttribute('for');
   if (forId) sel = root.querySelector('#'+CSS.escape(forId));
@@ -57,7 +59,7 @@ FAST_SELECT_JS = """
   }
   if (!sel) return {ok:false, reason:'select not found'};
 
-  // 3) choose option by text (includes)
+  // choose option by text (includes)
   let idx = -1;
   for (let i=0;i<sel.options.length;i++){
     const t = norm(sel.options[i].textContent);
@@ -65,23 +67,23 @@ FAST_SELECT_JS = """
   }
   if (idx === -1) return {ok:false, reason:'option not found'};
 
-  // 4) set & fire events (native + bootstrap-select)
   sel.selectedIndex = idx;
   sel.dispatchEvent(new Event('input',{bubbles:true}));
   sel.dispatchEvent(new Event('change',{bubbles:true}));
-  try {
-    sel.dispatchEvent(new Event('changed.bs.select',{bubbles:true}));
-  } catch(e) {}
+  try { sel.dispatchEvent(new Event('changed.bs.select',{bubbles:true})); } catch(e) {}
   return {ok:true, value: sel.options[idx].textContent.trim()};
 }
 """
 
 FAST_MULTISELECT_ALL_JS = """
-(root, labelText) => {
+(root, args) => {
+  const { labelText } = args;
   const norm = s => (s||'').trim().toLowerCase();
+
   let label = Array.from(root.querySelectorAll('label'))
       .find(l => norm(l.textContent).includes(norm(labelText)));
   if (!label) return {ok:false, reason:'label not found'};
+
   let sel = null;
   const forId = label.getAttribute('for');
   if (forId) sel = root.querySelector('#'+CSS.escape(forId));
@@ -91,6 +93,7 @@ FAST_MULTISELECT_ALL_JS = """
       : (label.closest('div') || root).querySelector('select');
   }
   if (!sel) return {ok:false, reason:'select not found'};
+
   let changed=false;
   for (const o of sel.options){ if(!o.selected){ o.selected=true; changed=true; } }
   if (changed) {
@@ -103,11 +106,11 @@ FAST_MULTISELECT_ALL_JS = """
 """
 
 async def fast_select(panel, label, text):
-    res = await panel.evaluate(FAST_SELECT_JS, label, text)
+    res = await panel.evaluate(FAST_SELECT_JS, {"labelText": label, "wanted": text})
     return bool(res and res.get("ok"))
 
 async def fast_select_all(panel, label):
-    res = await panel.evaluate(FAST_MULTISELECT_ALL_JS, label)
+    res = await panel.evaluate(FAST_MULTISELECT_ALL_JS, {"labelText": label})
     return bool(res and res.get("ok"))
 
 async def panel_input_value(panel, selectors) -> str:
@@ -116,7 +119,7 @@ async def panel_input_value(panel, selectors) -> str:
             loc = panel.locator(sel).first
             if await loc.count():
                 v = (await loc.input_value()).strip()
-                if v: 
+                if v:
                     return v
         except Exception:
             pass
@@ -141,10 +144,9 @@ async def panel_has_rows(panel):
     except Exception:
         return False
 
-# ===================== SHOW REPORT + PERIOD (PANEL) =====================
+# ===================== SHOW REPORT (PANEL) =====================
 
 async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000):
-    # Click the Show Report inside the panel only.
     clicked = False
     for sel in [
         "button:has-text('Show Report')",
@@ -161,7 +163,6 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
         except Exception:
             pass
     if not clicked:
-        # JS fallback inside panel
         clicked = await panel.evaluate("""
           (root)=>{
             const norm=s=>(s||'').trim().toLowerCase();
@@ -184,10 +185,7 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     except Exception:
         pass
 
-    # Your requested settle
     await asyncio.sleep(settle_ms/1000)
-
-    # Quick check for rows (don't over-wait)
     return await panel_has_rows(panel)
 
 # ===================== PDF (PANEL) =====================
@@ -235,31 +233,29 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
         return False
 
 async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min_bytes=7000):
-    # honor settle then click pdf
     if settle_ms > 0:
         await asyncio.sleep(settle_ms/1000)
 
     async def do_click():
         ok = await click_pdf_icon(panel)
-        if not ok: 
+        if not ok:
             raise RuntimeError("PDF icon not found in panel")
 
     ok = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
-    if not ok: 
+    if not ok:
         return False
 
     try:
         size = Path(save_path).stat().st_size
         log(f"[pdf] size: {size} bytes")
         if size < min_bytes:
-            # one quick retry
             await asyncio.sleep(2.0)
             ok2 = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
-            if not ok2: 
+            if not ok2:
                 return False
             size2 = Path(save_path).stat().st_size
             log(f"[pdf] retry size: {size2} bytes")
-            if size2 < min_bytes: 
+            if size2 < min_bytes:
                 return False
     except FileNotFoundError:
         return False
@@ -307,7 +303,7 @@ async def site_login_and_download():
         for _ in range(2):
             try:
                 await page.goto(login_url, wait_until="domcontentloaded"); break
-            except PWTimeout as e: 
+            except PWTimeout as e:
                 last_err = e
         if last_err:
             raise last_err
@@ -336,11 +332,10 @@ async def site_login_and_download():
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
-        # Navigate to Application Wise Report (coarse selectors, then panel-scope)
+        # Navigate to Application Wise Report
         try:
             await page.get_by_text("MIS Reports", exact=False).first.click(timeout=7000)
         except Exception:
-            # fallback click_first style
             await page.locator("a:has-text('MIS Reports'), button:has-text('MIS Reports'), li:has-text('MIS Reports')").first.click(timeout=7000)
         await asyncio.sleep(0.1)
         await page.get_by_text("Application Wise Report", exact=False).first.click(timeout=10000)
@@ -349,7 +344,7 @@ async def site_login_and_download():
         # Bind panel once
         panel = await get_app_panel(page)
 
-        # Capture dates (read-only; we won’t modify unless they’re empty)
+        # Capture dates (read-only; we won’t modify unless emptied by site)
         captured_from = await panel_input_value(panel, [
             "#fromDate","input#fromDate","input[name='fromDate']","input[name*='fromdate' i]","input[placeholder*='From' i]"
         ])
@@ -359,7 +354,6 @@ async def site_login_and_download():
         log(f"[dates] defaults (panel): From='{captured_from}' To='{captured_to}'")
 
         async def run_one(status_text: str, filename: str):
-            # Fast selects
             await fast_select(panel, "Circle Office",   "LUDHIANA CANAL CIRCLE")
             await fast_select(panel, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
             await fast_select_all(panel, "Nature Of Application")
@@ -367,14 +361,19 @@ async def site_login_and_download():
 
             # If site cleared dates, restore to defaults (but do not change otherwise)
             if not await panel_input_value(panel, ["#fromDate","input[name='fromDate']"]):
-                await panel.evaluate("(root,v)=>{const i=root.querySelector('#fromDate, input[name=\"fromDate\"]'); if(i){i.value=v; i.dispatchEvent(new Event('change',{bubbles:true}));}}", captured_from)
+                await panel.evaluate(
+                    "(root, v)=>{const i=root.querySelector('#fromDate, input[name=\"fromDate\"]'); if(i){i.value=v; i.dispatchEvent(new Event('change',{bubbles:true}));}}",
+                    captured_from
+                )
             if not await panel_input_value(panel, ["#toDate","input[name='toDate']"]):
-                await panel.evaluate("(root,v)=>{const i=root.querySelector('#toDate, input[name=\"toDate\"]'); if(i){i.value=v; i.dispatchEvent(new Event('change',{bubbles:true}));}}", captured_to)
+                await panel.evaluate(
+                    "(root, v)=>{const i=root.querySelector('#toDate, input[name=\"toDate\"]'); if(i){i.value=v; i.dispatchEvent(new Event('change',{bubbles:true}));}}",
+                    captured_to
+                )
 
             log(f"[A] Show Report → {status_text}")
             has_rows = await show_report_and_wait(panel, settle_ms=5600, response_wait_ms=8000)
             if not has_rows:
-                # one quick retry
                 log("[A] No rows after first try; retrying Show Report quickly…")
                 has_rows = await show_report_and_wait(panel, settle_ms=3000, response_wait_ms=5000)
             if not has_rows:
