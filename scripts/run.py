@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, re
+import os, sys, asyncio, traceback, re, base64
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
@@ -35,7 +35,7 @@ FROM_FIXED_DATE_VARIANTS = (
     "26/07/2024",
 )
 
-# Treat anything below this as a "blank/header-only" PDF (your manual good file ~54,696 bytes)
+# Treat anything below this as a "blank/header-only" PDF (your manual good file ~54 KB)
 MIN_VALID_PDF_BYTES = 50000
 
 def log(msg):
@@ -213,7 +213,7 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     if not clicked:
         raise RuntimeError("Show Report button not found in panel")
 
-    # best-effort: wait for a report-ish response (but don't stall too long)
+    # best-effort: wait for a report-ish response
     try:
         await panel.page.wait_for_response(
             lambda r: any(k in (r.url or '').lower() for k in (
@@ -283,7 +283,7 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600):
         if not ok:
             raise RuntimeError("PDF icon not found in panel")
 
-    ok = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
+    ok = await click_and_wait_download(panel.page, do_click, save_as_path=save_path, timeout_ms=35000)
     if not ok:
         return False, 0
 
@@ -294,51 +294,42 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600):
     except FileNotFoundError:
         return False, 0
 
-# ===================== LOCAL PRINT FALLBACK (panel → PDF) =====================
+# ===================== LOCAL FALLBACK v2: panel screenshot → fresh-page PDF =====================
 
-PRINT_INJECT_CSS = """
-<style id="__print_only">
-  @media print {
-    body * { visibility: hidden !important; }
-    #__print_target, #__print_target * { visibility: visible !important; }
-    #__print_target { position: absolute; left: 0; top: 0; width: 100% !important; }
-  }
-</style>
-"""
-
-async def render_panel_to_pdf(panel, pdf_path: Path):
+async def render_panel_via_screenshot_to_pdf(panel, pdf_path: Path):
+    """Screenshot just the report panel (as PNG), embed it into a clean HTML page, and print to PDF."""
     page = panel.page
-    # Wrap the panel in a special container and inject @media print CSS
-    await page.evaluate(
-        """({ panelSelector, css }) => {
-            const panel = document.querySelector(panelSelector);
-            if (!panel) return;
-            if (!document.getElementById('__print_only')) {
-              document.head.insertAdjacentHTML('beforeend', css);
-            }
-            const wrapId = '__print_target';
-            if (!document.getElementById(wrapId)) {
-              const wrapper = document.createElement('div');
-              wrapper.id = wrapId;
-              panel.parentNode.insertBefore(wrapper, panel);
-              wrapper.appendChild(panel);
-            }
-        }""",
-        {
-            "panelSelector": await panel.evaluate("e => e.tagName === 'DIV' ? '#' + (e.id || '') : 'div'"),
-            "css": PRINT_INJECT_CSS,
-        }
-    )
+    # 1) Take a crisp screenshot of the panel content only
+    png_bytes = await panel.screenshot(type="png")
+    b64 = base64.b64encode(png_bytes).decode("ascii")
 
-    # Ensure print media and save PDF
-    await page.emulate_media(media="print")
-    await page.pdf(
-        path=str(pdf_path),
-        format="A4",
-        margin={"top": "8mm", "right": "8mm", "bottom": "8mm", "left": "8mm"},
-        print_background=True,
-    )
-    log(f"[pdf:fallback] printed panel to → {pdf_path}")
+    # 2) Open a fresh page with just the image
+    ctx = page.context
+    tmp = await ctx.new_page()
+    html = f"""
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8"/>
+    <title>Report</title>
+    <style>
+      html, body {{ margin:0; padding:0; }}
+      .wrap {{ width: 100%; box-sizing: border-box; padding: 8mm; }}
+      img {{ width: 100%; height: auto; display: block; }}
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <img src="data:image/png;base64,{b64}" alt="report"/>
+    </div>
+  </body>
+</html>
+"""
+    await tmp.set_content(html, wait_until="load")
+    await tmp.emulate_media(media="print")
+    await tmp.pdf(path=str(pdf_path), format="A4", margin={"top":"0","right":"0","bottom":"0","left":"0"}, print_background=True)
+    await tmp.close()
+    log(f"[pdf:fallback] panel screenshot rendered to → {pdf_path}")
 
 # ===================== DATES: TRY MULTIPLE FORMATS THEN SHOW REPORT =====================
 
@@ -466,13 +457,13 @@ async def site_login_and_download():
             save_path = OUT / f"{filename} {stamp}.pdf"
             ok, size = await download_pdf_from_panel(panel, save_path, settle_ms=5600)
 
-            # 2) If blank (or failed), print the panel to PDF locally
+            # 2) If blank (or failed), render panel screenshot to clean PDF
             if (not ok) or (size < MIN_VALID_PDF_BYTES):
                 if ok:
-                    log(f"[pdf] server export looks blank ({size} bytes < {MIN_VALID_PDF_BYTES}); using print fallback.")
+                    log(f"[pdf] server export looks blank ({size} bytes < {MIN_VALID_PDF_BYTES}); using screenshot→PDF fallback.")
                 else:
-                    log("[pdf] server export failed; using print fallback.")
-                await render_panel_to_pdf(panel, save_path)
+                    log("[pdf] server export failed; using screenshot→PDF fallback.")
+                await render_panel_via_screenshot_to_pdf(panel, save_path)
 
             log(f"Saved {save_path.name}")
             return str(save_path)
