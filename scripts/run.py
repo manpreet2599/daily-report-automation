@@ -24,16 +24,17 @@ async def snap(page, name, full=False):
     try: await page.screenshot(path=str(OUT / name), full_page=bool(full))
     except Exception: pass
 
-# ---------- Strong selectors for date inputs ----------
+# ===================== DATE INPUT HELPERS =====================
+
 FROM_DATE_CANDIDATES = [
     "#fromDate", "input#fromDate", "input[name='fromDate']",
-    "input[name*='fromdate' i]", "input[name*='from' i][type='text']",
-    "xpath=//label[contains(.,'From Date')]/following::input[1]"
+    "input[name*='fromdate' i]", "input[placeholder*='From' i]",
+    "xpath=//label[contains(normalize-space(),'From Date')]/following::input[1]"
 ]
 TO_DATE_CANDIDATES = [
     "#toDate", "input#toDate", "input[name='toDate']",
-    "input[name*='todate' i]", "input[name*='to' i][type='text']",
-    "xpath=//label[contains(.,'To Date')]/following::input[1]"
+    "input[name*='todate' i]", "input[placeholder*='To' i]",
+    "xpath=//label[contains(normalize-space(),'To Date')]/following::input[1]"
 ]
 
 async def get_first_input_value(p, candidates) -> str:
@@ -52,19 +53,16 @@ async def set_first_input_value(p, candidates, value: str) -> bool:
             loc = p.locator(sel).first
             if await loc.count():
                 await loc.fill(value)
-                # fire events in case site listens
-                await p.evaluate("""
-                (sel)=>{
-                  const el = document.querySelector(sel);
-                  if(!el) return;
-                  el.dispatchEvent(new Event('input',{bubbles:true}));
-                  el.dispatchEvent(new Event('change',{bubbles:true}));
-                }""", sel.replace("xpath=",""))  # fine for css/xpath; harmless if css
+                # fire events if the site listens
+                try:
+                    await p.eval_on_selector(sel, "el => { el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }")
+                except Exception: pass
                 return True
         except Exception: pass
     return False
 
-# ---------- Data-row readiness checks ----------
+# ===================== TABLE / DATA READY =====================
+
 async def _has_data_rows(page):
     try:
         return await page.evaluate("""
@@ -87,14 +85,17 @@ async def _has_data_rows(page):
 
 async def _wait_for_data_rows(page, timeout_ms=30000):
     end = asyncio.get_event_loop().time() + timeout_ms/1000.0
-    try: await page.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
-    except Exception: pass
+    try:
+        await page.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
+    except Exception:
+        pass
     while asyncio.get_event_loop().time() < end:
         if await _has_data_rows(page): return True
         await asyncio.sleep(0.3)
     return False
 
-# ---------- Download helpers (unchanged) ----------
+# ===================== DOWNLOAD HELPERS =====================
+
 async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=35000):
     log("[pdf] trying direct download…")
     try:
@@ -126,7 +127,8 @@ async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=35000):
             log(f"[pdf] popup fallback failed: {e2}")
             return False
 
-# ---------- UI helpers (unchanged sections omitted for brevity in this comment) ----------
+# ===================== GENERIC UI HELPERS =====================
+
 async def fill_first(page, candidates, value):
     for sel in candidates:
         try:
@@ -156,9 +158,264 @@ async def _dump_near(p, label_text: str, tag: str):
         (OUT / f"debug_near_{tag}.html").write_text(html or "", encoding="utf-8")
     except Exception: pass
 
-# (Dropdown helpers from your current script remain the same; omitted here to save space)
+# ===================== SELECT HELPERS (native + bootstrap) =====================
 
-# ---------- After Show Report ----------
+def _resp_matcher(substrings):
+    low = [s.lower() for s in substrings]
+    def _inner(resp):
+        try:
+            url = resp.url.lower()
+            return any(s in url for s in low)
+        except Exception:
+            return False
+    return _inner
+
+async def wait_for_any_response(p, substrings, timeout_ms=10000):
+    try:
+        await p.wait_for_response(_resp_matcher(substrings), timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+async def get_options_count(p, select_css: str):
+    try:
+        return await p.eval_on_selector(select_css, "s => s ? s.options.length : 0")
+    except Exception:
+        return 0
+
+async def wait_options_increase(p, select_css: str, min_count=2, timeout_ms=8000):
+    end = asyncio.get_event_loop().time() + timeout_ms/1000.0
+    while asyncio.get_event_loop().time() < end:
+        cnt = await get_options_count(p, select_css)
+        if cnt >= min_count: return True
+        await asyncio.sleep(0.1)
+    return False
+
+async def _native_select(p, label_text: str, id_candidates, name_candidates, option_text: str):
+    label_based = [
+        f"label:has-text('{label_text}') + select",
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
+        f"text={label_text} >> xpath=following::select[1]",
+    ]
+    for sel in label_based:
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_text); return True, sel
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_text); return True, sel
+                except Exception: pass
+    for key in id_candidates:
+        sel = f"select#{key}"
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_text); return True, sel
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_text); return True, sel
+                except Exception: pass
+    for key in name_candidates:
+        sel = f"select[name='{key}'], select[name*='{key}']"
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_text); return True, sel
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_text); return True, sel
+                except Exception: pass
+    return False, None
+
+async def _bootstrap_select(p, label_text: str, option_text: str):
+    toggle_candidates = [
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]",
+        f"label:has-text('{label_text}') + * button.dropdown-toggle",
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::button[contains(@class,'dropdown-toggle')][1]",
+    ]
+    for tsel in toggle_candidates:
+        if await p.locator(tsel).count():
+            try:
+                btn = p.locator(tsel).first
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                menu = p.locator(".dropdown-menu.show, .show .dropdown-menu").first
+                await menu.wait_for(timeout=5000)
+
+                found = False
+                for _ in range(20):
+                    candidate = menu.locator("li, a, span, .text").filter(has_text=option_text).first
+                    if await candidate.count():
+                        await candidate.scroll_into_view_if_needed()
+                        await candidate.click(timeout=5000, force=True)
+                        found = True
+                        break
+                    try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
+                    except Exception: pass
+
+                try: await p.keyboard.press("Escape")
+                except Exception: pass
+                if found: return True
+            except Exception:
+                try: await p.keyboard.press("Escape")
+                except Exception: pass
+    return False
+
+async def select_circle(p, option_text: str):
+    log(f"[filter] Circle Office → {option_text}")
+    ok, sel = await _native_select(
+        p, "Circle Office",
+        id_candidates=["circle", "circleId", "circleOffice", "circle_office"],
+        name_candidates=["circle", "circleId", "circleOffice", "circle_office"],
+        option_text=option_text
+    )
+    if ok:
+        await snap(p, "after_select_circle.png")
+        return True
+    ok = await _bootstrap_select(p, "Circle Office", option_text)
+    await _dump_near(p, "Circle Office", "circle")
+    await snap(p, "after_select_circle.png")
+    return ok
+
+async def select_division(p, option_text: str):
+    log(f"[filter] Division Office → {option_text}")
+    label_selects = [
+        "label:has-text('Division Office') + select",
+        "xpath=//label[contains(normalize-space(),'Division Office')]/following::select[1]"
+    ]
+    native_sel = None
+    for css in label_selects:
+        if await p.locator(css).count():
+            native_sel = css
+            break
+    if not native_sel:
+        for css in ["select#division","select#divisionId","select#divisionOffice",
+                    "select[name='division']","select[name*='division']"]:
+            if await p.locator(css).count():
+                native_sel = css
+                break
+
+    if native_sel:
+        wait_resp = wait_for_any_response(
+            p,
+            substrings=["division", "getDivision", "bycircle", "divisionList", "getdivisions"],
+            timeout_ms=7000
+        )
+        wait_opts = wait_options_increase(p, native_sel, min_count=2, timeout_ms=7000)
+        await asyncio.gather(wait_resp, wait_opts)
+
+        for _ in range(50):
+            try:
+                if await p.locator(f"{native_sel} >> option", has_text=option_text).count():
+                    try:
+                        await p.select_option(native_sel, label=option_text)
+                    except Exception:
+                        await p.select_option(native_sel, value=option_text)
+                    await snap(p, "after_select_division.png")
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+
+    ok = await _bootstrap_select(p, "Division Office", option_text)
+    await _dump_near(p, "Division Office", "division")
+    await snap(p, "after_select_division.png")
+    return ok
+
+async def select_nature_all(p):
+    log(f"[filter] Nature Of Application → Select all (force)")
+    js = """
+    (labelText) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(document.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes(norm(labelText)));
+      if (!L) return { ok:false, reason:'label not found' };
+      const root = L.closest('div') || L.parentElement || document.body;
+      let sel = root.querySelector('select');
+      if (!sel) {
+        sel = (L.nextElementSibling && L.nextElementSibling.matches('select')) ? L.nextElementSibling : null;
+        if (!sel) {
+          const candidates = Array.from(root.querySelectorAll('select'));
+          sel = candidates.length ? candidates[0] : null;
+        }
+      }
+      if (!sel) return { ok:false, reason:'select not found' };
+      let changed = false;
+      for (const o of sel.options) {
+        if (!o.selected) { o.selected = true; changed = true; }
+      }
+      if (changed) {
+        sel.dispatchEvent(new Event('input',  { bubbles:true }));
+        sel.dispatchEvent(new Event('change', { bubbles:true }));
+      }
+      return { ok:true };
+    }
+    """
+    try:
+        res = await p.evaluate(js, "Nature Of Application")
+        await snap(p, "after_select_nature.png")
+        return bool(res.get("ok"))
+    except Exception:
+        await snap(p, "fail_nature.png")
+        return False
+
+async def select_status(p, option_text: str):
+    log(f"[filter] Status → {option_text}")
+    ok, sel = await _native_select(
+        p, "Status",
+        id_candidates=["status","statusId","appStatus","applicationStatus"],
+        name_candidates=["status","statusId","appStatus","applicationStatus"],
+        option_text=option_text
+    )
+    if ok:
+        await snap(p, "after_select_status.png")
+        return True
+
+    js = """
+    (wanted) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(document.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes('status'));
+      if (!L) return false;
+      const root = L.closest('div') || L.parentElement || document.body;
+      const sel = root.querySelector('select');
+      if (!sel) return false;
+      const w = norm(wanted);
+      let idx = -1;
+      for (let i=0;i<sel.options.length;i++){
+        const txt = norm(sel.options[i].textContent);
+        if (txt.includes(w)) { idx = i; break; }
+      }
+      if (idx === -1) return false;
+      sel.selectedIndex = idx;
+      sel.dispatchEvent(new Event('input', {bubbles:true}));
+      sel.dispatchEvent(new Event('change', {bubbles:true}));
+      return true;
+    }
+    """
+    try:
+        ok2 = await p.evaluate(js, option_text)
+        await snap(p, "after_select_status.png")
+        return bool(ok2)
+    except Exception:
+        pass
+
+    ok = await _bootstrap_select(p, "Status", option_text)
+    await _dump_near(p, "Status", "status")
+    await snap(p, "after_select_status.png")
+    return ok
+
+async def wait_for_report_table(p, timeout_ms=30000):
+    try:
+        await p.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
+        return True
+    except Exception:
+        try:
+            await p.get_by_text("No", exact=False).wait_for(timeout=2000)
+            return True
+        except Exception:
+            return False
+
+# ===================== SHOW REPORT & PDF =====================
+
 async def show_report_and_wait(page):
     await click_first(page, [
         "button:has-text('Show Report')",
@@ -174,13 +431,13 @@ async def show_report_and_wait(page):
         except Exception:
             raise RuntimeError("Report table did not populate with data rows.")
 
-# ---------- Click red PDF icon ----------
 async def click_report_pdf_icon(page):
-    for sel in [
+    candidates = [
         "xpath=//div[contains(.,'Application Wise Report')]//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
         "xpath=(//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
         "xpath=(//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
-    ]:
+    ]
+    for sel in candidates:
         if await page.locator(sel).count():
             ico = page.locator(sel).first
             await ico.scroll_into_view_if_needed()
@@ -188,7 +445,6 @@ async def click_report_pdf_icon(page):
             return True
     return False
 
-# ---------- Robust PDF download with settle + size check ----------
 async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int = 5600, min_bytes: int = 7000):
     if not await _has_data_rows(page):
         log("[pdf] Warning: no data rows detected just before download; giving 1.5s grace.")
@@ -196,7 +452,8 @@ async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int 
     if settle_ms > 0: await asyncio.sleep(settle_ms / 1000)
 
     async def do_pdf_click():
-        if not await click_report_pdf_icon(page):
+        clicked = await click_report_pdf_icon(page)
+        if not clicked:
             raise RuntimeError("Red PDF icon not found")
 
     ok_dl = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
@@ -222,7 +479,8 @@ async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int 
             return False
     return True
 
-# ---------------- main flow ----------------
+# ===================== MAIN FLOW =====================
+
 async def site_login_and_download():
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username    = os.environ["USERNAME"]
@@ -230,25 +488,28 @@ async def site_login_and_download():
     user_type   = os.getenv("USER_TYPE", "").strip()
     stamp       = today_str()
 
-    # capture here for reuse + guard script
     captured_from = ""
     captured_to   = ""
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
-                  "--disable-background-networking","--disable-background-timer-throttling",
-                  "--disable-breakpad","--disable-client-side-phishing-detection","--disable-default-apps",
-                  "--disable-hang-monitor","--disable-ipc-flooding-protection","--disable-popup-blocking",
-                  "--disable-prompt-on-repost","--metrics-recording-only","--no-first-run",
-                  "--safebrowsing-disable-auto-update"]
+            args=[
+                "--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
+                "--disable-background-networking","--disable-background-timer-throttling",
+                "--disable-breakpad","--disable-client-side-phishing-detection",
+                "--disable-default-apps","--disable-hang-monitor",
+                "--disable-ipc-flooding-protection","--disable-popup-blocking",
+                "--disable-prompt-on-repost","--metrics-recording-only","--no-first-run",
+                "--safebrowsing-disable-auto-update"
+            ]
         )
         context = await browser.new_context(accept_downloads=True)
 
+        # keep css/images to avoid breaking date widgets; only block fonts
         async def speed_filter(route, request):
             rtype = request.resource_type
-            if rtype in ("font",):  # keep images/css; datepicker might rely on them
+            if rtype in ("font",):
                 await route.abort()
             else:
                 await route.continue_()
@@ -259,13 +520,13 @@ async def site_login_and_download():
 
         page = await context.new_page()
 
-        # --- Guard that auto-restores dates if site JS clears them ---
+        # Guard: auto-restore dates if site JS clears them
         await page.add_init_script("""
         (function(){
           window.__keepDates = {from:'', to:''};
           const setBack = () => {
-            const f = document.querySelector('#fromDate, input[name="fromDate"], input[name*="fromdate" i], input[name*="from" i][type="text"]');
-            const t = document.querySelector('#toDate,   input[name="toDate"],   input[name*="todate" i],   input[name*="to"   i][type="text"]');
+            const f = document.querySelector('#fromDate, input[name="fromDate"], input[name*="fromdate" i], input[placeholder*="From" i]');
+            const t = document.querySelector('#toDate, input[name="toDate"], input[name*="todate" i], input[placeholder*="To" i]');
             if (f && window.__keepDates.from && !f.value) {
               f.value = window.__keepDates.from;
               f.dispatchEvent(new Event('input',{bubbles:true}));
@@ -278,13 +539,13 @@ async def site_login_and_download():
             }
           };
           const mo = new MutationObserver(setBack);
-          document.addEventListener('DOMContentLoaded', ()=>setBack());
+          document.addEventListener('DOMContentLoaded', setBack);
           mo.observe(document.documentElement, {subtree:true, childList:true, attributes:true});
-          setInterval(setBack, 500); // very light; ensures restoration even after async clears
+          setInterval(setBack, 500);
         })();
         """)
 
-        # --- Login ---
+        # ---- Login ----
         log(f"Opening login page: {login_url}")
         last_err = None
         for _ in range(2):
@@ -293,7 +554,6 @@ async def site_login_and_download():
             except PWTimeout as e: last_err = e
         if last_err: raise last_err
 
-        await snap(page, "step1_login_page.png")
         if user_type:
             for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
                 if await page.locator(sel).count():
@@ -307,10 +567,10 @@ async def site_login_and_download():
             ["input[name='username']", "#username", "input[name='login']", "#login",
              "input[name='userid']", "#userid", "#loginid", "input[name='loginid']",
              "input[placeholder*='Email']", "input[placeholder*='Mobile']", "input[placeholder*='Login']"],
-            os.environ["USERNAME"])
+            username)
         await fill_first(page,
             ["input[name='password']", "#password", "input[name='pwd']", "#pwd", "input[placeholder='Password']"],
-            os.environ["PASSWORD"])
+            password)
         await snap(page, "step2_before_login.png")
 
         await click_first(page,
@@ -322,8 +582,10 @@ async def site_login_and_download():
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
-        # --- Navigate to Application Wise Report ---
+        # ---- Navigate to Application Wise Report ----
         async def open_application_wise(p):
+            nonlocal captured_from, captured_to
+
             log("[A] Opening 'MIS Reports'…")
             if not await click_first(p, [
                 "nav >> text=MIS Reports","text=MIS Reports","a:has-text('MIS Reports')",
@@ -338,7 +600,9 @@ async def site_login_and_download():
                 "text=Application Wise Report","a:has-text('Application Wise Report')",
                 "[role='menuitem']:has-text('Application Wise Report')","li:has-text('Application Wise Report')"
             ], timeout=6000)
-            if not ok: raise RuntimeError("[A] Could not open 'Application Wise Report'")
+            if not ok:
+                await snap(p, "fail_open_app_wise.png")
+                raise RuntimeError("[A] Could not open 'Application Wise Report'")
 
             try:
                 await p.wait_for_url(re.compile(r".*/Authorities/applicationwisereport\.jsp.*"), timeout=20000)
@@ -349,31 +613,32 @@ async def site_login_and_download():
             await snap(p, "after_open_app_wise.png")
 
             # Capture default dates precisely
-            nonlocal captured_from, captured_to
             captured_from = await get_first_input_value(p, FROM_DATE_CANDIDATES)
             captured_to   = await get_first_input_value(p, TO_DATE_CANDIDATES)
             log(f"[dates] captured defaults: From='{captured_from}' To='{captured_to}'")
 
-            # feed the guard values so any clears are auto-restored
-            await p.evaluate("(f,t)=>{window.__keepDates.from=f; window.__keepDates.to=t;}", captured_from, captured_to)
-
-        # (Your dropdown helpers are used here as-is)
-        from_select_circle = select_circle
-        from_select_division = select_division
-        from_select_nature_all = select_nature_all
-        from_select_status = select_status
+            # Feed guard so any clears are auto-restored
+            try:
+                await p.evaluate("(f,t)=>{window.__keepDates.from=f; window.__keepDates.to=t;}", captured_from, captured_to)
+            except Exception:
+                pass
 
         async def apply_common_filters(p):
-            ok1 = await from_select_circle(p, "LUDHIANA CANAL CIRCLE")
-            ok2 = await from_select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            ok3 = await from_select_nature_all(p)
-            (OUT / "dropdown_warning.txt").write_text(f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8")
+            # Circle
+            ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
+            # Division
+            ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
+            # Nature(all)
+            ok3 = await select_nature_all(p)
+            (OUT / "dropdown_warning.txt").write_text(
+                f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
+            )
 
         async def set_status_and_download(p, status_text: str, save_path: Path):
-            ok4 = await from_select_status(p, status_text)
+            ok4 = await select_status(p, status_text)
             log(f"[A] Status set to '{status_text}' (ok={ok4})")
 
-            # If either date is blank now, restore captured defaults
+            # Ensure dates present before Show Report
             cur_from = await get_first_input_value(p, FROM_DATE_CANDIDATES)
             cur_to   = await get_first_input_value(p, TO_DATE_CANDIDATES)
             if not cur_from and captured_from:
@@ -384,29 +649,35 @@ async def site_login_and_download():
 
             await show_report_and_wait(p)
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
-            log(f"[A] Report grid is visible ({status_text}).")
 
-            ok_dl = await download_report_pdf_with_checks(p, save_path=save_path, settle_ms=5600, min_bytes=7000)
+            ok_dl = await download_report_pdf_with_checks(
+                p,
+                save_path=save_path,
+                settle_ms=5600,
+                min_bytes=7000
+            )
             if not ok_dl:
                 await snap(p, f"fail_pdf_click_{status_text.lower()}.png")
                 raise RuntimeError(f"[A] Could not obtain a valid PDF ({status_text})")
             log(f"[A] PDF saved → {save_path}")
 
+        # === Flow ===
         await open_application_wise(page)
         await apply_common_filters(page)
 
-        pathA = OUT / f"Delayed Apps {today_str()}.pdf"
+        pathA = OUT / f"Delayed Apps {stamp}.pdf"
         await set_status_and_download(page, "DELAYED", pathA)
         log(f"Saved {pathA.name}")
 
-        pathB = OUT / f"Pending Apps {today_str()}.pdf"
+        pathB = OUT / f"Pending Apps {stamp}.pdf"
         await set_status_and_download(page, "PENDING", pathB)
         log(f"Saved {pathB.name}")
 
         await context.close(); await browser.close()
     return [str(pathA), str(pathB)]
 
-# --------------- Telegram (unchanged) ---------------
+# ===================== TELEGRAM =====================
+
 async def send_via_telegram(files):
     bot = os.getenv("TELEGRAM_BOT_TOKEN"); chat = os.getenv("TELEGRAM_CHAT_ID")
     if not bot or not chat:
@@ -421,13 +692,18 @@ async def send_via_telegram(files):
             log(f"Telegram send failed for {p}: {r.text}")
             raise RuntimeError("Telegram send failed")
 
+# ===================== ENTRY =====================
+
 async def main():
     files = await site_login_and_download()
     log("Downloads complete: " + ", ".join([Path(f).name for f in files]))
-    try: await send_via_telegram(files)
-    except Exception as e: log(f"Telegram send error (continuing): {e}")
+    try:
+        await send_via_telegram(files)
+    except Exception as e:
+        log(f"Telegram send error (continuing): {e}")
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
+    try:
+        asyncio.run(main())
     except Exception as e:
         traceback.print_exc(); sys.exit(1)
