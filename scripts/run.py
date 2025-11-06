@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, re, base64, time
+import os, sys, asyncio, traceback, re, base64, time, json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -71,7 +71,6 @@ async def _bs_find_toggle_in_root(root, label_text: str):
     return root.locator(f"xpath={xp}").first
 
 async def _bs_find_toggle_by_text_any(root, needle_regex: str):
-    # find ANY bootstrap-select whose button text matches regex (case-insensitive)
     btns = root.locator(".bootstrap-select .dropdown-toggle")
     count = await btns.count()
     rx = re.compile(needle_regex, re.I)
@@ -83,7 +82,7 @@ async def _bs_find_toggle_by_text_any(root, needle_regex: str):
             txt = ""
         if rx.search(txt):
             return b
-    return root.locator("__never__")  # empty
+    return root.locator("__never__")
 
 async def _bs_wait_button_text_in_root(root, label_text: str, expect_text: str, timeout_ms=6000):
     btn = await _bs_find_toggle_in_root(root, label_text)
@@ -233,20 +232,11 @@ async def select_option_any(panel, page, label_text: str, option_text: str) -> b
 
 # ====== Nature Of Application (Select All) — robust ======
 async def select_nature_all(panel, page) -> bool:
-    """
-    Select ALL options for 'Nature Of Application' — works even if the label
-    is not <label>. Tries:
-      1) Find bootstrap-select by true label.
-      2) Find bootstrap-select whose button text contains 'nature' (case-insensitive).
-      3) Native multi-select: select every option.
-    Returns True on success, False otherwise.
-    """
-    # 1) true-label bootstrap
+    # 1) true-label bootstrap or any bootstrap with 'nature'
     btn = await _bs_find_toggle_in_root(panel, "Nature Of Application")
     if not await btn.count():
         btn = await _bs_find_toggle_by_text_any(panel, r"\bnature\b")
     if not await btn.count():
-        # try page-scope
         btn = await _bs_find_toggle_in_root(page, "Nature Of Application")
         if not await btn.count():
             btn = await _bs_find_toggle_by_text_any(page, r"\bnature\b")
@@ -259,7 +249,6 @@ async def select_nature_all(panel, page) -> bool:
             await menu.wait_for(timeout=4000)
         except Exception:
             await _close_dropdown_like_human(page)
-            pass
         # Prefer explicit "Select All"
         sel_all = menu.locator("li, a, span, .text").filter(has_text=re.compile(r"select\s*all", re.I)).first
         clicked = False
@@ -270,7 +259,6 @@ async def select_nature_all(panel, page) -> bool:
             except Exception:
                 clicked = False
         else:
-            # Fallback: click first 20 items
             vis = menu.locator("li:not(.disabled) a, li:not(.disabled) .text")
             cnt = await vis.count()
             for i in range(min(cnt, 20)):
@@ -281,7 +269,6 @@ async def select_nature_all(panel, page) -> bool:
                     pass
         await _close_dropdown_like_human(page)
 
-        # Verify button text no longer shows "None selected"
         try:
             inner = btn.locator(".filter-option-inner-inner").first
             txt = (await inner.inner_text() if await inner.count() else await btn.inner_text()).strip().lower()
@@ -289,14 +276,13 @@ async def select_nature_all(panel, page) -> bool:
             txt = ""
         ok = clicked and ("none selected" not in txt)
         log(f"[filter] Nature Of Application → Select All (bootstrap heuristic ok={ok})")
-        return ok
+        if ok: return True
 
-    # 3) Native multi-select select-all
+    # 2) Native multi-select select-all
     try:
         ok = await panel.evaluate("""
           (root) => {
             const norm = s => (s||'').trim().toLowerCase();
-            // find a select that is near text containing 'nature'
             const blocks = Array.from(root.querySelectorAll('div, section, form, fieldset'));
             let target = null;
             for (const b of blocks) {
@@ -396,6 +382,8 @@ async def panel_has_rows(panel):
         """)
     except Exception:
         return False
+
+# ===================== SHOW REPORT =====================
 
 async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000):
     clicked = False
@@ -632,6 +620,89 @@ async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_
                 return (True, size)
     return (ok, size)
 
+# ====== DOM → PDF (crisp, selectable) ======
+async def render_panel_dom_to_pdf(panel, pdf_path: Path):
+    """
+    Clone the panel DOM (including Period line and table) into a new page
+    with print CSS and render a proper text PDF.
+    """
+    page = panel.page
+    # Extract innerHTML of the panel + try to read a 'Period:' line if any
+    payload = await panel.evaluate("""
+      (root) => {
+        const html = root.outerHTML;
+        let period = '';
+        const candidates = Array.from(root.querySelectorAll('*'))
+          .filter(n => (n.textContent||'').toLowerCase().includes('period:'));
+        if (candidates.length) {
+          period = candidates[0].textContent.trim();
+        }
+        // Also capture selected filter badges/text if visible on buttons
+        const info = {};
+        const btns = Array.from(root.querySelectorAll('.bootstrap-select .dropdown-toggle'));
+        for (const b of btns) {
+          const key = (b.getAttribute('aria-label') || b.title || '').trim() ||
+                      (b.closest('div')?.previousElementSibling?.innerText?.trim() || '');
+          const inner = b.querySelector('.filter-option-inner-inner');
+          const val = (inner?.innerText || b.innerText || '').trim();
+          if (key && val) info[key] = val;
+        }
+        return { html, period, info };
+      }
+    """)
+    raw_html = payload.get("html","")
+    period_line = payload.get("period","")
+    info = payload.get("info",{}) or {}
+
+    # Build a clean printable HTML (no external CSS)
+    filters_badge = ""
+    if info:
+        items = [f"<li><strong>{k}:</strong> {v}</li>" for k,v in info.items()]
+        filters_badge = f"<div class='meta'><h3>Selected Filters</h3><ul>{''.join(items)}</ul></div>"
+    elif period_line:
+        filters_badge = f"<div class='meta'><h3>{period_line}</h3></div>"
+
+    html = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<title>Report</title>
+<style>
+  @page {{ size:A4; margin:12mm; }}
+  body {{ font-family: Arial, Helvetica, sans-serif; font-size: 12px; color:#111; }}
+  h1 {{ font-size: 18px; margin:0 0 8px 0; }}
+  .meta {{ margin: 0 0 10px 0; }}
+  .meta ul {{ margin: 6px 0 0 18px; }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th, td {{ border: 1px solid #999; padding: 6px 8px; vertical-align: top; }}
+  th {{ background:#f2f2f2; }}
+  /* try to force wide tables to wrap/fit */
+  td, th {{ word-break: break-word; }}
+</style>
+</head>
+<body>
+  <h1>Application Wise Report</h1>
+  {filters_badge}
+  <div id="panel">
+    {raw_html}
+  </div>
+  <script>
+    // Remove nested buttons/inputs from the cloned panel (just display)
+    const panel = document.querySelector('#panel');
+    panel.querySelectorAll('button, input, select').forEach(el => el.remove());
+  </script>
+</body>
+</html>"""
+
+    ctx = page.context
+    tmp = await ctx.new_page()
+    await tmp.set_content(html, wait_until="load")
+    await tmp.emulate_media(media="print")
+    await tmp.pdf(path=str(pdf_path), format="A4", print_background=True)
+    await tmp.close()
+    log(f"[pdf:dom] panel HTML rendered to → {pdf_path}")
+
+# ====== Screenshot → PDF (last resort) ======
 async def render_panel_via_screenshot_to_pdf(panel, pdf_path: Path):
     page = panel.page
     png_bytes = await panel.screenshot(type="png")
@@ -786,7 +857,7 @@ async def site_login_and_download():
                     await snap(page, "fail_division.png")
                     raise RuntimeError("Could not set Division Office (all methods)")
 
-            # 3) Nature of Application → **Select All BEFORE Status** (mandatory)
+            # 3) Nature of Application → **Select All BEFORE Status**
             ok_nat = await select_nature_all(panel, page)
             log(f"[filter] Nature Of Application → Select All result: {ok_nat}")
             if not ok_nat:
@@ -806,15 +877,24 @@ async def site_login_and_download():
 
             await snap(page, f"after_grid_shown_{status_text.lower()}.png")
 
-            # 6) Export PDF (download → capture&replay → screenshot fallback)
+            # 6) Try server PDF (download / replay). If still header-only → DOM→PDF, else screenshot last resort.
             save_path = OUT / f"{filename} {stamp}.pdf"
+            need_dom_fallback = True
             ok, size = await download_pdf_via_capture_and_replay(panel, save_path, settle_ms=5600)
-            if (not ok) or (size < MIN_VALID_PDF_BYTES):
+            if ok and size >= MIN_VALID_PDF_BYTES:
+                need_dom_fallback = False
+            else:
                 if ok:
-                    log(f"[pdf] replay still small ({size} bytes < {MIN_VALID_PDF_BYTES}); using screenshot→PDF fallback.")
+                    log(f"[pdf] server/replay PDF still small ({size} bytes < {MIN_VALID_PDF_BYTES}); switching to DOM→PDF.")
                 else:
-                    log("[pdf] could not obtain via replay; using screenshot→PDF fallback.")
-                await render_panel_via_screenshot_to_pdf(panel, save_path)
+                    log("[pdf] could not obtain via replay; switching to DOM→PDF.")
+
+            if need_dom_fallback:
+                try:
+                    await render_panel_dom_to_pdf(panel, save_path)
+                except Exception as e:
+                    log(f"[pdf:dom] failed ({e}); using screenshot→PDF fallback.")
+                    await render_panel_via_screenshot_to_pdf(panel, save_path)
 
             log(f"Saved {save_path.name}")
             return str(save_path)
