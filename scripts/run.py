@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, re, base64
+import os, sys, asyncio, traceback, re, base64, json, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional, Dict, Any, List, Tuple
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 from dotenv import load_dotenv
@@ -29,25 +30,17 @@ def ist_today_variants():
         d.strftime("%d/%m/%Y"),  # 06/11/2025
     )
 
-FROM_FIXED_DATE_VARIANTS = (
-    "2024-07-26",
-    "26-07-2024",
-    "26/07/2024",
-)
+FROM_FIXED_DATE_VARIANTS = ("2024-07-26", "26-07-2024", "26/07/2024")
 
-# Treat anything below this as a "blank/header-only" PDF (your manual good file ~54 KB)
+# Treat anything below this as a "blank/header-only" PDF (~29 KB observed)
 MIN_VALID_PDF_BYTES = 50000
 
-def log(msg):
-    print(msg, flush=True)
+def log(msg): print(msg, flush=True)
 
 async def snap(page, name, full=False):
-    if not DEBUG:
-        return
-    try:
-        await page.screenshot(path=str(OUT / name), full_page=bool(full))
-    except Exception:
-        pass
+    if not DEBUG: return
+    try: await page.screenshot(path=str(OUT / name), full_page=bool(full))
+    except Exception: pass
 
 # ===================== FAST PANEL BINDING =====================
 
@@ -164,7 +157,7 @@ async def panel_input_value(panel, selectors) -> str:
             pass
     return ""
 
-# ===================== DATA READINESS (PANEL-SCOPED, QUICK) =====================
+# ===================== DATA READINESS (PANEL) =====================
 
 async def panel_has_rows(panel):
     try:
@@ -183,7 +176,7 @@ async def panel_has_rows(panel):
     except Exception:
         return False
 
-# ===================== SHOW REPORT (PANEL) =====================
+# ===================== SHOW REPORT =====================
 
 async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000):
     clicked = False
@@ -213,7 +206,6 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     if not clicked:
         raise RuntimeError("Show Report button not found in panel")
 
-    # best-effort: wait for a report-ish response
     try:
         await panel.page.wait_for_response(
             lambda r: any(k in (r.url or '').lower() for k in (
@@ -227,10 +219,9 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     await asyncio.sleep(settle_ms/1000)
     return await panel_has_rows(panel)
 
-# ===================== PDF (PANEL) =====================
+# ===================== PDF ICON =====================
 
 async def click_pdf_icon(panel):
-    # Prefer an icon near the filters; fallback to first visible inside panel
     for sel in [
         "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')][ancestor::div[.//button[contains(.,'Show Report')]]]",
         "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
@@ -242,6 +233,137 @@ async def click_pdf_icon(panel):
             await ico.click(timeout=5000, force=True)
             return True
     return False
+
+# ===================== REQUEST CAPTURE & REPLAY =====================
+
+class RequestSniffer:
+    def __init__(self, page):
+        self.page = page
+        self.events: List[Dict[str, Any]] = []
+        self._req_handler = None
+        self._resp_handler = None
+
+    async def __aenter__(self):
+        async def on_request(req):
+            try:
+                body = None
+                try:
+                    body = req.post_data()  # may be None
+                except Exception:
+                    body = None
+                self.events.append({
+                    "type":"request",
+                    "time": time.time(),
+                    "url": req.url,
+                    "method": req.method,
+                    "headers": dict(req.headers),
+                    "post_data": body
+                })
+            except Exception:
+                pass
+
+        async def on_response(resp):
+            try:
+                hdrs = {}
+                try:
+                    hdrs = dict(resp.headers)
+                except Exception:
+                    hdrs = {}
+                self.events.append({
+                    "type":"response",
+                    "time": time.time(),
+                    "url": resp.url,
+                    "status": resp.status,
+                    "headers": hdrs
+                })
+            except Exception:
+                pass
+
+        self._req_handler = self.page.on("request", on_request)
+        self._resp_handler = self.page.on("response", on_response)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._req_handler:
+            self.page.off("request", self._req_handler)
+        if self._resp_handler:
+            self.page.off("response", self._resp_handler)
+
+    def find_pdf_exchange(self) -> Tuple[Optional[Dict[str,Any]], Optional[Dict[str,Any]]]:
+        """
+        Return (request_event, response_event) for the most recent likely-PDF exchange.
+        Heuristics: response header content-type includes 'pdf' OR URL contains 'pdf','export','download','report'
+        """
+        cand_resp = None
+        for ev in reversed(self.events):
+            if ev.get("type") == "response":
+                url_l = (ev.get("url") or "").lower()
+                h = {k.lower():v for k,v in (ev.get("headers") or {}).items()}
+                ctype = h.get("content-type","").lower()
+                if "pdf" in ctype or any(x in url_l for x in ("pdf","export","download","report")):
+                    cand_resp = ev
+                    break
+        if not cand_resp:
+            return (None, None)
+
+        # find nearest preceding request to same URL (best-effort)
+        cand_req = None
+        for ev in reversed(self.events):
+            if ev.get("type") == "request" and (ev.get("url")==cand_resp.get("url")):
+                cand_req = ev; break
+        # if not exact, pick most recent POST to a similar path
+        if not cand_req:
+            base = cand_resp.get("url","")
+            base_key = re.sub(r"\?.*$","", base)
+            for ev in reversed(self.events):
+                if ev.get("type")=="request" and ev.get("method") in ("POST","GET"):
+                    u = ev.get("url","")
+                    if re.sub(r"\?.*$","", u) == base_key:
+                        cand_req = ev; break
+        return (cand_req, cand_resp)
+
+async def safe_replay_pdf(context, req_event: Dict[str,Any], save_path: Path) -> bool:
+    """
+    Recreate the request with Playwright's APIRequestContext to fetch the real PDF.
+    """
+    if not req_event: return False
+    url = req_event.get("url")
+    method = (req_event.get("method") or "GET").upper()
+    headers = dict(req_event.get("headers") or {})
+    body = req_event.get("post_data")
+
+    # Drop headers that API layer should set itself or can cause 403/CSRF noise
+    for k in ["content-length","host","origin","referer","cookie","sec-fetch-site","sec-fetch-mode","sec-fetch-dest","sec-ch-ua","sec-ch-ua-platform","sec-ch-ua-mobile","user-agent"]:
+        headers.pop(k, None)
+
+    try:
+        if method == "POST":
+            resp = await context.request.post(url, data=body, headers=headers)
+        else:
+            resp = await context.request.get(url, headers=headers)
+    except Exception as e:
+        log(f"[replay] fetch error: {e}")
+        return False
+
+    if not resp.ok:
+        log(f"[replay] HTTP {resp.status} on replay")
+        return False
+
+    ctype = (resp.headers.get("content-type","") or "").lower()
+    if "pdf" not in ctype:
+        log(f"[replay] Not a PDF content-type: {ctype}")
+        return False
+
+    try:
+        b = await resp.body()
+        Path(save_path).write_bytes(b)
+        log(f"[replay] saved real PDF → {save_path} ({len(b)} bytes)")
+        return True
+    except Exception as e:
+        log(f"[replay] write error: {e}")
+        return False
+
+# ===================== DOWNLOAD / FALLBACKS =====================
 
 async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=35000):
     log("[pdf] trying direct download…")
@@ -273,9 +395,16 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
             log(f"[pdf] popup fallback failed: {e2}")
         return False
 
-async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600):
-    """Returns (ok, size_bytes_or_0)."""
-    if settle_ms > 0:
+async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_ms=5600) -> Tuple[bool,int]:
+    """
+    1) Attach sniffer
+    2) Click PDF icon while sniffer collects requests/responses
+    3) If direct download saved a small file, try to REPLAY the captured request and overwrite the file
+    Returns (ok, size_bytes)
+    """
+    page = panel.page
+    context = page.context
+    if settle_ms>0:
         await asyncio.sleep(settle_ms/1000)
 
     async def do_click():
@@ -283,62 +412,56 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600):
         if not ok:
             raise RuntimeError("PDF icon not found in panel")
 
-    ok = await click_and_wait_download(panel.page, do_click, save_as_path=save_path, timeout_ms=35000)
-    if not ok:
-        return False, 0
+    async with RequestSniffer(page) as sniff:
+        # Try normal download first (it will likely save ~29 KB)
+        ok = await click_and_wait_download(page, do_click, save_as_path=save_path, timeout_ms=35000)
+        size = 0
+        if ok:
+            try:
+                size = Path(save_path).stat().st_size
+                log(f"[pdf] size: {size} bytes")
+            except FileNotFoundError:
+                size = 0
 
-    try:
-        size = Path(save_path).stat().st_size
-        log(f"[pdf] size: {size} bytes")
-        return True, size
-    except FileNotFoundError:
-        return False, 0
+        # If file is clearly blank → try to replay
+        if (not ok) or (size < MIN_VALID_PDF_BYTES):
+            req_ev, resp_ev = sniff.find_pdf_exchange()
+            if not req_ev and not resp_ev:
+                log("[replay] No PDF-like network exchange captured.")
+                return (ok, size)
+            # Prefer the request event
+            target = req_ev or {}
+            r_ok = await safe_replay_pdf(context, target, save_path)
+            if r_ok:
+                try:
+                    size = Path(save_path).stat().st_size
+                except FileNotFoundError:
+                    size = 0
+                return (True, size)
+        return (ok, size)
 
-# ===================== LOCAL FALLBACK v2: panel screenshot → fresh-page PDF =====================
-
+# ---- Screenshot → PDF fallback (last resort) ----
 async def render_panel_via_screenshot_to_pdf(panel, pdf_path: Path):
-    """Screenshot just the report panel (as PNG), embed it into a clean HTML page, and print to PDF."""
     page = panel.page
-    # 1) Take a crisp screenshot of the panel content only
-    png_bytes = await panel.screenshot(type="png")
+    png_bytes = await panel.screenshot(type="png")  # captures full element (with scrolling)
     b64 = base64.b64encode(png_bytes).decode("ascii")
 
-    # 2) Open a fresh page with just the image
     ctx = page.context
     tmp = await ctx.new_page()
-    html = f"""
-<!doctype html>
-<html>
-  <head>
-    <meta charset="utf-8"/>
-    <title>Report</title>
-    <style>
-      html, body {{ margin:0; padding:0; }}
-      .wrap {{ width: 100%; box-sizing: border-box; padding: 8mm; }}
-      img {{ width: 100%; height: auto; display: block; }}
-    </style>
-  </head>
-  <body>
-    <div class="wrap">
-      <img src="data:image/png;base64,{b64}" alt="report"/>
-    </div>
-  </body>
-</html>
-"""
+    html = f"""<!doctype html><html><head><meta charset="utf-8"/><title>Report</title>
+    <style>html,body{{margin:0;padding:0}}.wrap{{width:100%;box-sizing:border-box;padding:8mm}}img{{width:100%;height:auto;display:block}}</style>
+    </head><body><div class="wrap"><img src="data:image/png;base64,{b64}" alt="report"/></div></body></html>"""
     await tmp.set_content(html, wait_until="load")
     await tmp.emulate_media(media="print")
     await tmp.pdf(path=str(pdf_path), format="A4", margin={"top":"0","right":"0","bottom":"0","left":"0"}, print_background=True)
     await tmp.close()
     log(f"[pdf:fallback] panel screenshot rendered to → {pdf_path}")
 
-# ===================== DATES: TRY MULTIPLE FORMATS THEN SHOW REPORT =====================
+# ===================== DATES =====================
 
 async def set_dates_and_show(panel, *, settle_ms_first=5600):
     to_variants = ist_today_variants()
-    tries = []
-    for f in FROM_FIXED_DATE_VARIANTS:
-        for t in to_variants:
-            tries.append((f, t))
+    tries = [(f,t) for f in FROM_FIXED_DATE_VARIANTS for t in to_variants]
 
     for idx, (from_val, to_val) in enumerate(tries, start=1):
         try:
@@ -347,16 +470,14 @@ async def set_dates_and_show(panel, *, settle_ms_first=5600):
         except Exception as e:
             log(f"[dates] set error on try {idx}: {e}")
 
-        has_rows = await show_report_and_wait(panel, settle_ms=settle_ms_first if idx == 1 else 3000, response_wait_ms=8000)
+        has_rows = await show_report_and_wait(panel, settle_ms=settle_ms_first if idx==1 else 3000, response_wait_ms=8000)
         if has_rows:
             log(f"[dates] data present with format try {idx}")
             return True
-
         log(f"[dates] no rows with try {idx}; trying next format…")
-
     return False
 
-# ===================== MAIN =====================
+# ===================== MAIN FLOW =====================
 
 async def site_login_and_download():
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
@@ -400,8 +521,7 @@ async def site_login_and_download():
                 await page.goto(login_url, wait_until="domcontentloaded"); break
             except PWTimeout as e:
                 last_err = e
-        if last_err:
-            raise last_err
+        if last_err: raise last_err
 
         if user_type:
             for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
@@ -414,7 +534,6 @@ async def site_login_and_download():
                         except Exception:
                             pass
 
-        # Fill creds
         for sel in ["#username","input[name='username']","input[placeholder*='Login']","input[placeholder*='Email']"]:
             if await page.locator(sel).count():
                 await page.fill(sel, username); break
@@ -436,33 +555,31 @@ async def site_login_and_download():
         await page.get_by_text("Application Wise Report", exact=False).first.click(timeout=10000)
         await page.wait_for_load_state("domcontentloaded")
 
-        # Bind panel once
         panel = await get_app_panel(page)
 
         async def run_one(status_text: str, filename: str):
-            # Filters (panel-scoped, fast)
             await fast_select(panel, "Circle Office",   "LUDHIANA CANAL CIRCLE")
             await fast_select(panel, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
             await fast_select_all(panel, "Nature Of Application")
             await fast_select(panel, "Status", status_text)
 
-            # Explicit date range (26/07/2024 → today) with multi-format fallback
             ok_rows = await set_dates_and_show(panel, settle_ms_first=5600)
             if not ok_rows:
                 raise RuntimeError(f"No data rows in panel after trying date formats ({status_text}).")
 
             await snap(page, f"after_grid_shown_{status_text.lower()}.png")
 
-            # 1) Try server export
             save_path = OUT / f"{filename} {stamp}.pdf"
-            ok, size = await download_pdf_from_panel(panel, save_path, settle_ms=5600)
 
-            # 2) If blank (or failed), render panel screenshot to clean PDF
+            # Try capture + replay (overwrites tiny server export)
+            ok, size = await download_pdf_via_capture_and_replay(panel, save_path, settle_ms=5600)
+
+            # Last resort: screenshot → PDF
             if (not ok) or (size < MIN_VALID_PDF_BYTES):
                 if ok:
-                    log(f"[pdf] server export looks blank ({size} bytes < {MIN_VALID_PDF_BYTES}); using screenshot→PDF fallback.")
+                    log(f"[pdf] replay still small ({size} bytes < {MIN_VALID_PDF_BYTES}); using screenshot→PDF fallback.")
                 else:
-                    log("[pdf] server export failed; using screenshot→PDF fallback.")
+                    log("[pdf] could not obtain via replay; using screenshot→PDF fallback.")
                 await render_panel_via_screenshot_to_pdf(panel, save_path)
 
             log(f"Saved {save_path.name}")
