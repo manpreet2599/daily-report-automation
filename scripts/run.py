@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, re, base64, json, time
+import os, sys, asyncio, traceback, re, base64, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
@@ -16,10 +16,10 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # === Date helpers ===
 IST = timezone(timedelta(hours=5, minutes=30))
-def now_ist():
+def now_ist() -> datetime:
     return datetime.now(IST)
 
-def today_for_filename():
+def today_for_filename() -> str:
     return now_ist().strftime("%d-%m-%Y")  # for file name only
 
 def ist_today_variants():
@@ -45,76 +45,137 @@ async def snap(page, name, full=False):
 # ===================== FAST PANEL BINDING =====================
 
 async def get_app_panel(page):
+    # Panel that contains "Application Wise Report"
     panel = page.locator("xpath=//div[.//text()[contains(.,'Application Wise Report')]]").first
     await panel.wait_for(state="visible", timeout=10000)
     return panel
 
-# ===================== FAST SELECT/INPUT OPS (PANEL-SCOPED) =====================
+# ===================== BOOTSTRAP-SELECT helpers (real clicks) =====================
 
-FAST_SELECT_JS = """
-(root, args) => {
-  const { labelText, wanted } = args;
-  const norm = s => (s||'').trim().toLowerCase();
-  const wantedNorm = norm(wanted);
+async def _bs_find_toggle(panel, label_text: str):
+    # Finds the bootstrap-select toggle button associated with a label
+    return panel.locator(
+        f"xpath=.//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]"
+    ).first
 
-  let label = Array.from(root.querySelectorAll('label'))
-      .find(l => norm(l.textContent).includes(norm(labelText)));
-  if (!label) return {ok:false, reason:'label not found'};
+async def _bs_wait_button_text(panel, label_text: str, expect_text: str, timeout_ms=6000):
+    # wait until the visible button shows chosen text
+    btn = await _bs_find_toggle(panel, label_text)
+    try:
+        await btn.wait_for(timeout=timeout_ms)
+        inner = btn.locator(".filter-option-inner-inner").first
+        tgt = inner if await inner.count() else btn
+        await panel.page.wait_for_function(
+            """(el, want) => (el.innerText||'').trim().toLowerCase().includes(want.toLowerCase())""",
+            tgt, expect_text, timeout=timeout_ms
+        )
+        return True
+    except Exception:
+        return False
 
-  let sel = null;
-  const forId = label.getAttribute('for');
-  if (forId) sel = root.querySelector('#'+CSS.escape(forId));
-  if (!sel) {
-    sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
-      ? label.nextElementSibling
-      : (label.closest('div') || root).querySelector('select');
-  }
-  if (!sel) return {ok:false, reason:'select not found'};
+async def _bs_close_dropdown(panel):
+    # close by Escape and click on dead space (like you do manually)
+    try:
+        await panel.page.keyboard.press("Escape")
+    except Exception:
+        pass
+    try:
+        await panel.page.mouse.click(1, 1)
+    except Exception:
+        pass
+    await asyncio.sleep(0.15)
 
-  let idx = -1;
-  for (let i=0;i<sel.options.length;i++){
-    const t = norm(sel.options[i].textContent);
-    if (t.includes(wantedNorm)) { idx = i; break; }
-  }
-  if (idx === -1) return {ok:false, reason:'option not found'};
+async def bs_select_option(panel, label_text: str, option_text: str) -> bool:
+    """
+    Open bootstrap-select near `label_text`, click menu item containing `option_text`,
+    close the dropdown, and confirm the button shows the chosen text.
+    """
+    btn = await _bs_find_toggle(panel, label_text)
+    if not await btn.count():
+        return False
 
-  sel.selectedIndex = idx;
-  sel.dispatchEvent(new Event('input',{bubbles:true}));
-  sel.dispatchEvent(new Event('change',{bubbles:true}));
-  try { sel.dispatchEvent(new Event('changed.bs.select',{bubbles:true})); } catch(e) {}
-  return {ok:true, value: sel.options[idx].textContent.trim()};
-}
-"""
+    # open
+    await btn.scroll_into_view_if_needed()
+    await btn.click(timeout=5000)
 
-FAST_MULTISELECT_ALL_JS = """
-(root, args) => {
-  const { labelText } = args;
-  const norm = s => (s||'').trim().toLowerCase();
+    # menu (scope to the open menu container)
+    menu = panel.locator(".dropdown-menu.show, .show .dropdown-menu").first
+    try:
+        await menu.wait_for(timeout=4000)
+    except Exception:
+        return False
 
-  let label = Array.from(root.querySelectorAll('label'))
-      .find(l => norm(l.textContent).includes(norm(labelText)));
-  if (!label) return {ok:false, reason:'label not found'};
+    # find a visible menu entry that contains the text
+    item = menu.locator("li, a, span, .text").filter(has_text=option_text).first
+    if not await item.count():
+        # gentle scroll attempts
+        for _ in range(12):
+            try:
+                await menu.evaluate("(m)=>m.scrollBy(0,250)")
+            except Exception:
+                pass
+            if await menu.locator("li, a, span, .text").filter(has_text=option_text).first.count():
+                item = menu.locator("li, a, span, .text").filter(has_text=option_text).first
+                break
 
-  let sel = null;
-  const forId = label.getAttribute('for');
-  if (forId) sel = root.querySelector('#'+CSS.escape(forId));
-  if (!sel) {
-    sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
-      ? label.nextElementSibling
-      : (label.closest('div') || root).querySelector('select');
-  }
-  if (!sel) return {ok:false, reason:'select not found'};
+    if not await item.count():
+        await _bs_close_dropdown(panel)
+        return False
 
-  let changed=false;
-  for (const o of sel.options){ if(!o.selected){ o.selected=true; changed=true; } }
-  if (changed) {
-    sel.dispatchEvent(new Event('input',{bubbles:true}));
-    sel.dispatchEvent(new Event('change',{bubbles:true}));
-    try { sel.dispatchEvent(new Event('changed.bs.select',{bubbles:true})); } catch(e) {}
-  }
-  return {ok:true};
-}
-"""
+    await item.scroll_into_view_if_needed()
+    await item.click(timeout=5000, force=True)
+
+    # close dropdown like you do manually
+    await _bs_close_dropdown(panel)
+
+    # confirm button text shows the chosen option
+    ok = await _bs_wait_button_text(panel, label_text, option_text, timeout_ms=6000)
+    return ok
+
+async def bs_select_all_if_present(panel, label_text: str) -> bool:
+    """
+    For multi-selects (e.g., Nature Of Application), click "Select All" if present.
+    Falls back to selecting visible items.
+    """
+    btn = await _bs_find_toggle(panel, label_text)
+    if not await btn.count():
+        return False
+
+    await btn.scroll_into_view_if_needed()
+    await btn.click(timeout=5000)
+
+    menu = panel.locator(".dropdown-menu.show, .show .dropdown-menu").first
+    try:
+        await menu.wait_for(timeout=4000)
+    except Exception:
+        return False
+
+    # Prefer explicit "Select All"
+    sel_all = menu.locator("li, a, span, .text").filter(has_text=re.compile(r"select\s*all", re.I)).first
+    if await sel_all.count():
+        await sel_all.click(timeout=5000, force=True)
+        await _bs_close_dropdown(panel)
+        return True
+
+    # Otherwise, try clicking first ~20 items
+    clicked = False
+    try:
+        vis = menu.locator("li:not(.disabled) a, li:not(.disabled) .text")
+        count = await vis.count()
+        for i in range(min(count, 20)):
+            it = vis.nth(i)
+            try:
+                await it.click(timeout=1000)
+                clicked = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    await _bs_close_dropdown(panel)
+    return clicked
+
+# ===================== DATE INPUTS (set via DOM & events) =====================
 
 DATE_FILL_JS = """
 (root, args) => {
@@ -136,26 +197,6 @@ DATE_FILL_JS = """
   return {okFrom, okTo};
 }
 """
-
-async def fast_select(panel, label, text):
-    res = await panel.evaluate(FAST_SELECT_JS, {"labelText": label, "wanted": text})
-    return bool(res and res.get("ok"))
-
-async def fast_select_all(panel, label):
-    res = await panel.evaluate(FAST_MULTISELECT_ALL_JS, {"labelText": label})
-    return bool(res and res.get("ok"))
-
-async def panel_input_value(panel, selectors) -> str:
-    for sel in selectors:
-        try:
-            loc = panel.locator(sel).first
-            if await loc.count():
-                v = (await loc.input_value()).strip()
-                if v:
-                    return v
-        except Exception:
-            pass
-    return ""
 
 # ===================== DATA READINESS (PANEL) =====================
 
@@ -248,7 +289,7 @@ class RequestSniffer:
             try:
                 body = None
                 try:
-                    body = req.post_data()  # may be None
+                    body = req.post_data()
                 except Exception:
                     body = None
                 self.events.append({
@@ -292,7 +333,8 @@ class RequestSniffer:
     def find_pdf_exchange(self) -> Tuple[Optional[Dict[str,Any]], Optional[Dict[str,Any]]]:
         """
         Return (request_event, response_event) for the most recent likely-PDF exchange.
-        Heuristics: response header content-type includes 'pdf' OR URL contains 'pdf','export','download','report'
+        Heuristics: response header content-type includes 'pdf'
+                    OR URL contains 'pdf','export','download','report'
         """
         cand_resp = None
         for ev in reversed(self.events):
@@ -306,12 +348,10 @@ class RequestSniffer:
         if not cand_resp:
             return (None, None)
 
-        # find nearest preceding request to same URL (best-effort)
         cand_req = None
         for ev in reversed(self.events):
             if ev.get("type") == "request" and (ev.get("url")==cand_resp.get("url")):
                 cand_req = ev; break
-        # if not exact, pick most recent POST to a similar path
         if not cand_req:
             base = cand_resp.get("url","")
             base_key = re.sub(r"\?.*$","", base)
@@ -332,7 +372,7 @@ async def safe_replay_pdf(context, req_event: Dict[str,Any], save_path: Path) ->
     headers = dict(req_event.get("headers") or {})
     body = req_event.get("post_data")
 
-    # Drop headers that API layer should set itself or can cause 403/CSRF noise
+    # Drop headers that API layer should set itself or can cause 403/CSRF issues
     for k in ["content-length","host","origin","referer","cookie","sec-fetch-site","sec-fetch-mode","sec-fetch-dest","sec-ch-ua","sec-ch-ua-platform","sec-ch-ua-mobile","user-agent"]:
         headers.pop(k, None)
 
@@ -412,10 +452,10 @@ async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_
         if not ok:
             raise RuntimeError("PDF icon not found in panel")
 
+    ok = False
+    size = 0
     async with RequestSniffer(page) as sniff:
-        # Try normal download first (it will likely save ~29 KB)
         ok = await click_and_wait_download(page, do_click, save_as_path=save_path, timeout_ms=35000)
-        size = 0
         if ok:
             try:
                 size = Path(save_path).stat().st_size
@@ -429,7 +469,6 @@ async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_
             if not req_ev and not resp_ev:
                 log("[replay] No PDF-like network exchange captured.")
                 return (ok, size)
-            # Prefer the request event
             target = req_ev or {}
             r_ok = await safe_replay_pdf(context, target, save_path)
             if r_ok:
@@ -438,12 +477,13 @@ async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_
                 except FileNotFoundError:
                     size = 0
                 return (True, size)
-        return (ok, size)
+    return (ok, size)
 
 # ---- Screenshot → PDF fallback (last resort) ----
 async def render_panel_via_screenshot_to_pdf(panel, pdf_path: Path):
     page = panel.page
-    png_bytes = await panel.screenshot(type="png")  # captures full element (with scrolling)
+    # capture entire panel area; if very tall, Playwright scrolls internally
+    png_bytes = await panel.screenshot(type="png")
     b64 = base64.b64encode(png_bytes).decode("ascii")
 
     ctx = page.context
@@ -555,23 +595,31 @@ async def site_login_and_download():
         await page.get_by_text("Application Wise Report", exact=False).first.click(timeout=10000)
         await page.wait_for_load_state("domcontentloaded")
 
+        # Bind panel once
         panel = await get_app_panel(page)
 
         async def run_one(status_text: str, filename: str):
-            await fast_select(panel, "Circle Office",   "LUDHIANA CANAL CIRCLE")
-            await fast_select(panel, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            await fast_select_all(panel, "Nature Of Application")
-            await fast_select(panel, "Status", status_text)
+            # Filters (click the REAL dropdowns like you do manually)
+            ok_c = await bs_select_option(panel, "Circle Office",   "LUDHIANA CANAL CIRCLE")
+            if not ok_c: raise RuntimeError("Could not set Circle Office via bootstrap-select")
 
+            ok_d = await bs_select_option(panel, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
+            if not ok_d: raise RuntimeError("Could not set Division Office via bootstrap-select")
+
+            await bs_select_all_if_present(panel, "Nature Of Application")
+
+            ok_s = await bs_select_option(panel, "Status", status_text)
+            if not ok_s: raise RuntimeError(f"Could not set Status='{status_text}' via bootstrap-select")
+
+            # Explicit date range (26/07/2024 → today) with multi-format fallback
             ok_rows = await set_dates_and_show(panel, settle_ms_first=5600)
             if not ok_rows:
-                raise RuntimeError(f"No data rows in panel after trying date formats ({status_text}).")
+                raise RuntimeError(f"No data rows after filters+dates for status {status_text}")
 
             await snap(page, f"after_grid_shown_{status_text.lower()}.png")
 
+            # Try capture + replay (will overwrite tiny server export)
             save_path = OUT / f"{filename} {stamp}.pdf"
-
-            # Try capture + replay (overwrites tiny server export)
             ok, size = await download_pdf_via_capture_and_replay(panel, save_path, settle_ms=5600)
 
             # Last resort: screenshot → PDF
@@ -622,3 +670,5 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         traceback.print_exc(); sys.exit(1)
+
+   
