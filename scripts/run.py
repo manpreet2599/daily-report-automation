@@ -20,7 +20,7 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 def today_for_filename() -> str:
-    return now_ist().strftime("%d-%m-%Y")
+    return now_ist().strftime("%d-%m-%Y")  # for file name only
 
 def ist_today_variants():
     d = now_ist()
@@ -32,7 +32,7 @@ def ist_today_variants():
 
 FROM_FIXED_DATE_VARIANTS = ("2024-07-26", "26-07-2024", "26/07/2024")
 
-# anything below this looks like the server's header-only export (~29 KB)
+# treat anything below this size as blank/header-only export
 MIN_VALID_PDF_BYTES = 50000
 
 def log(msg): print(msg, flush=True)
@@ -56,7 +56,6 @@ async def get_app_panel(page):
 # ===================== BOOTSTRAP-SELECT + NATIVE HELPERS =====================
 
 def _label_xpath_ci(label_text: str) -> str:
-    # case-insensitive contains() for label text
     return (
         "contains("
         "translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), "
@@ -65,7 +64,6 @@ def _label_xpath_ci(label_text: str) -> str:
     )
 
 async def _bs_find_toggle_in_root(root, label_text: str):
-    # Find bootstrap-select toggle by label (relative to a root locator)
     xp = (
         f".//label[{_label_xpath_ci(label_text)}]"
         f"/following::*[contains(@class,'bootstrap-select')][1]"
@@ -88,7 +86,6 @@ async def _bs_wait_button_text_in_root(root, label_text: str, expect_text: str, 
         return False
 
 async def _bs_close_dropdown(page):
-    # close the dropdown like you do: Escape + click dead space
     try: await page.keyboard.press("Escape")
     except Exception: pass
     try: await page.mouse.click(1, 1)
@@ -96,18 +93,14 @@ async def _bs_close_dropdown(page):
     await asyncio.sleep(0.15)
 
 async def bs_select_option_in_root(root, label_text: str, option_text: str) -> bool:
-    """
-    Primary path: real bootstrap-select click inside a given root (panel or page).
-    """
     btn = await _bs_find_toggle_in_root(root, label_text)
     if not await btn.count():
         return False
 
-    # open
     await btn.scroll_into_view_if_needed()
     await btn.click(timeout=6000)
 
-    # menu is usually appended to body; use page-wide visible menu
+    # visible menu (often appended to body)
     menu = root.page.locator(".dropdown-menu.show, .show .dropdown-menu").first
     try:
         await menu.wait_for(timeout=5000)
@@ -115,10 +108,8 @@ async def bs_select_option_in_root(root, label_text: str, option_text: str) -> b
         await _bs_close_dropdown(root.page)
         return False
 
-    # find visible item containing the target text
     item = menu.locator("li, a, span, .text").filter(has_text=option_text).first
     if not await item.count():
-        # gentle scroll attempts
         for _ in range(16):
             try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
             except Exception: pass
@@ -132,13 +123,11 @@ async def bs_select_option_in_root(root, label_text: str, option_text: str) -> b
 
     await item.scroll_into_view_if_needed()
     await item.click(timeout=6000, force=True)
-
     await _bs_close_dropdown(root.page)
 
     ok = await _bs_wait_button_text_in_root(root, label_text, option_text, timeout_ms=6000)
     return ok
 
-# Native <select> helper (relative to a root)
 NATIVE_SELECT_JS = """
 (root, args) => {
   const { labelText, wanted } = args;
@@ -183,37 +172,27 @@ async def native_select_option_in_root(root, label_text: str, option_text: str) 
         return False
 
 async def select_option_any(panel, page, label_text: str, option_text: str) -> bool:
-    """
-    Layered selection:
-      1) panel-scoped bootstrap-select
-      2) panel-scoped native
-      3) page-scoped bootstrap-select (global)
-      4) page-scoped native (global)
-      5) last chance: find any <select> whose options contain the text and set it
-    """
-    # 1 & 2: panel scope
+    # 1: panel bootstrap
     ok = await bs_select_option_in_root(panel, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (panel bootstrap)")
         return True
-
+    # 2: panel native
     ok = await native_select_option_in_root(panel, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (panel native)")
         return True
-
-    # 3 & 4: page scope
+    # 3: page bootstrap
     ok = await bs_select_option_in_root(page, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (page bootstrap)")
         return True
-
+    # 4: page native
     ok = await native_select_option_in_root(page, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (page native)")
         return True
-
-    # 5: last chance — select ANY <select> whose options contain the text
+    # 5: any-select fallback (by option text only)
     try:
         found = await page.evaluate("""
           (wanted) => {
@@ -245,84 +224,44 @@ async def select_option_any(panel, page, label_text: str, option_text: str) -> b
     log(f"[filter] {label_text} FAILED to set '{option_text}' (all methods).")
     return False
 
-async def bs_select_all_if_present(panel, page, label_text: str) -> bool:
-    """
-    For multi-selects (e.g., Nature Of Application), click "Select All" if present.
-    Panel scope → page scope → native all.
-    """
-    for root in (panel, page):
-        btn = await _bs_find_toggle_in_root(root, label_text)
-        if await btn.count():
-            await btn.scroll_into_view_if_needed()
-            await btn.click(timeout=6000)
-            menu = page.locator(".dropdown-menu.show, .show .dropdown-menu").first
-            try:
-                await menu.wait_for(timeout=4000)
-            except Exception:
-                await _bs_close_dropdown(page)
-                continue
-
-            sel_all = menu.locator("li, a, span, .text").filter(has_text=re.compile(r"select\s*all", re.I)).first
-            if await sel_all.count():
-                await sel_all.click(timeout=5000, force=True)
-                await _bs_close_dropdown(page)
-                log(f"[filter] {label_text} → Select All (bootstrap)")
-                return True
-
-            # else click first N visible items
-            clicked = False
-            try:
-                vis = menu.locator("li:not(.disabled) a, li:not(.disabled) .text")
-                count = await vis.count()
-                for i in range(min(count, 20)):
-                    it = vis.nth(i)
-                    try:
-                        await it.click(timeout=800)
-                        clicked = True
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            await _bs_close_dropdown(page)
-            if clicked:
-                log(f"[filter] {label_text} → selected multiple (bootstrap)")
-                return True
-
-    # native select-all
-    try:
-        ok = await panel.evaluate("""
-          (root, labelText) => {
-            const norm = s => (s||'').trim().toLowerCase();
-            let label = Array.from(root.querySelectorAll('label'))
-              .find(l => norm(l.textContent).includes(norm(labelText)));
-            let sel = null;
-            if (label) {
-              const forId = label.getAttribute('for');
-              if (forId) sel = root.querySelector('#'+CSS.escape(forId));
-              if (!sel) {
-                sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
-                  ? label.nextElementSibling
-                  : (label.closest('div') || root).querySelector('select');
+# ====== NEW: wait until an option text exists in ANY select (for dependent dropdowns) ======
+async def wait_until_option_exists_any_select(page, option_text: str, timeout_ms: int = 20000) -> bool:
+    deadline = time.time() + timeout_ms/1000
+    while time.time() < deadline:
+        try:
+            exists = await page.evaluate("""
+              (wanted) => {
+                const norm = s => (s||'').trim().toLowerCase();
+                const w = norm(wanted);
+                for (const sel of document.querySelectorAll('select')) {
+                  for (const opt of sel.options) {
+                    if (norm(opt.textContent).includes(w)) return true;
+                  }
+                }
+                return false;
               }
-            } else {
-              sel = root.querySelector('select');
-            }
-            if (!sel) return false;
-            let changed = false;
-            for (const o of sel.options) { if (!o.selected) { o.selected = true; changed = true; } }
-            if (changed) {
-              sel.dispatchEvent(new Event('input',{bubbles:true}));
-              sel.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-            return true;
-          }
-        """, label_text)
-        if ok:
-            log(f"[filter] {label_text} → Select All (native)")
-            return True
-    except Exception:
-        pass
+            """, option_text)
+            if exists:
+                return True
+        except Exception:
+            pass
+        await asyncio.sleep(0.2)
     return False
+
+# A convenience: wait for fetch/XHR hint + the option to show up
+async def wait_division_options_after_circle(page, target_division_text: str, max_wait_ms: int = 20000):
+    # try to catch a division-related network response while polling the DOM
+    async def wait_response():
+        try:
+            await page.wait_for_response(
+                lambda r: any(k in (r.url or '').lower() for k in (
+                    "division", "getdivision", "bycircle", "divisionlist", "getdivisions"
+                )),
+                timeout=max_wait_ms
+            )
+        except Exception:
+            pass
+    await asyncio.gather(wait_response(), wait_until_option_exists_any_select(page, target_division_text, max_wait_ms))
 
 # ===================== DATE INPUTS =====================
 
@@ -505,7 +444,6 @@ async def safe_replay_pdf(context, req_event: Dict[str,Any], save_path: Path) ->
     headers = dict(req_event.get("headers") or {})
     body = req_event.get("post_data")
 
-    # Drop brittle headers
     for k in ["content-length","host","origin","referer","cookie","sec-fetch-site","sec-fetch-mode",
               "sec-fetch-dest","sec-ch-ua","sec-ch-ua-platform","sec-ch-ua-mobile","user-agent"]:
         headers.pop(k, None)
@@ -606,7 +544,6 @@ async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_
                 return (True, size)
     return (ok, size)
 
-# ---- Screenshot → PDF fallback ----
 async def render_panel_via_screenshot_to_pdf(panel, pdf_path: Path):
     page = panel.page
     png_bytes = await panel.screenshot(type="png")
@@ -727,22 +664,52 @@ async def site_login_and_download():
         log("[nav] Application Wise Report panel ready.")
 
         async def run_one(status_text: str, filename: str):
-            # Filters (robust layered selection)
+            # 1) Circle
             if not await select_option_any(panel, page, "Circle Office", "LUDHIANA CANAL CIRCLE"):
                 await snap(page, "fail_circle.png")
                 raise RuntimeError("Could not set Circle Office (all methods)")
 
-            if not await select_option_any(panel, page, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION"):
-                await snap(page, "fail_division.png")
-                raise RuntimeError("Could not set Division Office (all methods)")
+            # 2) Division depends on Circle → wait for options to appear, then select
+            target_div = "FARIDKOT CANAL AND GROUND WATER DIVISION"
+            log("[wait] Waiting for Division list to populate after Circle…")
+            await wait_division_options_after_circle(page, target_division_text=target_div, max_wait_ms=25000)
 
+            # try selection again (now that options are present)
+            if not await select_option_any(panel, page, "Division Office", target_div):
+                # last-chance: directly pick the option where it exists
+                picked = await page.evaluate("""
+                  (wanted) => {
+                    const norm = s => (s||'').trim().toLowerCase();
+                    const w = norm(wanted);
+                    const selects = Array.from(document.querySelectorAll('select'));
+                    for (const sel of selects) {
+                      for (let i=0;i<sel.options.length;i++){
+                        if (norm(sel.options[i].textContent).includes(w)) {
+                          sel.selectedIndex = i;
+                          sel.dispatchEvent(new Event('input',{bubbles:true}));
+                          sel.dispatchEvent(new Event('change',{bubbles:true}));
+                          return true;
+                        }
+                      }
+                    }
+                    return false;
+                  }
+                """, target_div)
+                if picked:
+                    log(f"[filter] Division Office → {target_div} (direct any-select set after wait)")
+                else:
+                    await snap(page, "fail_division.png")
+                    raise RuntimeError("Could not set Division Office (all methods)")
+
+            # 3) Nature of Application → select all if present
             await bs_select_all_if_present(panel, page, "Nature Of Application")
 
+            # 4) Status
             if not await select_option_any(panel, page, "Status", status_text):
                 await snap(page, f"fail_status_{status_text}.png")
                 raise RuntimeError(f"Could not set Status='{status_text}' (all methods)")
 
-            # Dates 26/07/2024 → today
+            # 5) Dates 26/07/2024 → today + show
             ok_rows = await set_dates_and_show(panel, settle_ms_first=5600)
             if not ok_rows:
                 await snap(page, f"fail_rows_{status_text}.png", full=True)
@@ -750,11 +717,9 @@ async def site_login_and_download():
 
             await snap(page, f"after_grid_shown_{status_text.lower()}.png")
 
-            # Try capture + replay (will overwrite tiny server export)
+            # 6) Export PDF (download → capture&replay → screenshot fallback)
             save_path = OUT / f"{filename} {stamp}.pdf"
             ok, size = await download_pdf_via_capture_and_replay(panel, save_path, settle_ms=5600)
-
-            # Last resort: screenshot → PDF
             if (not ok) or (size < MIN_VALID_PDF_BYTES):
                 if ok:
                     log(f"[pdf] replay still small ({size} bytes < {MIN_VALID_PDF_BYTES}); using screenshot→PDF fallback.")
@@ -802,3 +767,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         traceback.print_exc(); sys.exit(1)
+
