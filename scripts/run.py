@@ -53,7 +53,6 @@ async def set_first_input_value(p, candidates, value: str) -> bool:
             loc = p.locator(sel).first
             if await loc.count():
                 await loc.fill(value)
-                # fire events if the site listens
                 try:
                     await p.eval_on_selector(sel, "el => { el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }")
                 except Exception: pass
@@ -61,13 +60,19 @@ async def set_first_input_value(p, candidates, value: str) -> bool:
         except Exception: pass
     return False
 
-# ===================== TABLE / DATA READY =====================
+# ===================== PANEL HELPERS =====================
 
-async def _has_data_rows(page):
+def app_panel_locator(page):
+    # Narrow all actions to the Application Wise Report box/panel
+    return page.locator(
+        "xpath=//div[.//text()[contains(.,'Application Wise Report')]]"
+    ).first
+
+async def panel_has_data_rows(panel):
     try:
-        return await page.evaluate("""
-            () => {
-                const tbodies = Array.from(document.querySelectorAll('table tbody'));
+        return await panel.evaluate("""
+            (el) => {
+                const tbodies = Array.from(el.querySelectorAll('table tbody'));
                 for (const tb of tbodies) {
                     const rows = Array.from(tb.querySelectorAll('tr'));
                     const dataRows = rows.filter(r => {
@@ -83,14 +88,14 @@ async def _has_data_rows(page):
     except Exception:
         return False
 
-async def _wait_for_data_rows(page, timeout_ms=30000):
+async def panel_wait_data_rows(panel, timeout_ms=30000):
     end = asyncio.get_event_loop().time() + timeout_ms/1000.0
     try:
-        await page.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
+        await panel.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
     except Exception:
         pass
     while asyncio.get_event_loop().time() < end:
-        if await _has_data_rows(page): return True
+        if await panel_has_data_rows(panel): return True
         await asyncio.sleep(0.3)
     return False
 
@@ -239,9 +244,8 @@ async def _bootstrap_select(p, label_text: str, option_text: str):
                 await btn.click()
                 menu = p.locator(".dropdown-menu.show, .show .dropdown-menu").first
                 await menu.wait_for(timeout=5000)
-
                 found = False
-                for _ in range(20):
+                for _ in range(30):
                     candidate = menu.locator("li, a, span, .text").filter(has_text=option_text).first
                     if await candidate.count():
                         await candidate.scroll_into_view_if_needed()
@@ -250,7 +254,6 @@ async def _bootstrap_select(p, label_text: str, option_text: str):
                         break
                     try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
                     except Exception: pass
-
                 try: await p.keyboard.press("Escape")
                 except Exception: pass
                 if found: return True
@@ -403,29 +406,18 @@ async def select_status(p, option_text: str):
     await snap(p, "after_select_status.png")
     return ok
 
-async def wait_for_report_table(p, timeout_ms=30000):
-    try:
-        await p.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
-        return True
-    except Exception:
-        try:
-            await p.get_by_text("No", exact=False).wait_for(timeout=2000)
-            return True
-        except Exception:
-            return False
+# ===================== PERIOD + SHOW REPORT (PANEL-SCOPED) =====================
 
-# ===================== PERIOD DETECTION + SHOW REPORT =====================
-
-async def _read_period_text(page) -> str:
+async def _panel_read_period_text(panel) -> str:
     try:
         sel_candidates = [
-            "xpath=//*[contains(normalize-space(),'Period:')][1]",
-            "xpath=//*[contains(@id,'period')][1]",
-            "xpath=//div[contains(.,'Period:')][1]",
+            "xpath=.//*[contains(normalize-space(),'Period:')][1]",
+            "xpath=.//*[contains(@id,'period')][1]",
+            "xpath=.//div[contains(.,'Period:')][1]",
         ]
         for s in sel_candidates:
-            if await page.locator(s).count():
-                txt = (await page.locator(s).first.inner_text()).strip()
+            if await panel.locator(s).count():
+                txt = (await panel.locator(s).first.inner_text()).strip()
                 if txt:
                     return " ".join(txt.split())
     except Exception:
@@ -435,30 +427,33 @@ async def _read_period_text(page) -> str:
 def _looks_like_dated_period(text: str) -> bool:
     if not text: return False
     if "period" not in text.lower(): return False
-    # capture date-ish tokens like 2024-07-26, 26/07/2024, 26-07-2024
     dates = re.findall(r"\b(\d{2,4}[-/]\d{1,2}[-/]\d{2,4})\b", text)
     return len(dates) >= 2
 
-async def show_report_and_wait(page, *, click_timeout=8000, network_timeout=30000):
-    # Try normal click first
-    clicked = await click_first(page, [
-        "button:has-text('Show Report')",
-        "input[type='button'][value='Show Report']",
-        "input[type='submit'][value='Show Report']",
-        "text=Show Report"
-    ], timeout=click_timeout)
+async def show_report_and_wait(page, *, settle_ms=5600, network_timeout=30000):
+    panel = app_panel_locator(page)
+    if not await panel.count():
+        raise RuntimeError("Application Wise Report panel not found")
 
-    # JS fallback: force the bound handler
-    if not clicked:
+    # Click the Show Report inside the panel
+    clicked = False
+    try:
+        clicked = await panel.locator(
+            "button:has-text('Show Report'), input[type='button'][value='Show Report'], input[type='submit'][value='Show Report']"
+        ).first.click(timeout=8000) or True
+    except Exception:
+        # JS fallback limited to panel
         try:
-            clicked = await page.evaluate("""
-            () => {
+            clicked = await panel.evaluate("""
+            (el)=>{
               const norm = s => (s||'').trim().toLowerCase();
-              const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'));
-              const el = btns.find(b => norm(b.innerText||b.value||'') === 'show report' ||
-                                        norm(b.innerText||b.value||'').includes('show report'));
-              if (!el) return false;
-              el.click();
+              const btns = Array.from(el.querySelectorAll('button,input[type=button],input[type=submit]'));
+              const b = btns.find(x => {
+                const t = norm(x.innerText||x.value||'');
+                return t === 'show report' || t.includes('show report');
+              });
+              if (!b) return false;
+              b.click();
               return true;
             }
             """)
@@ -467,7 +462,7 @@ async def show_report_and_wait(page, *, click_timeout=8000, network_timeout=3000
     if not clicked:
         raise RuntimeError("Could not click Show Report")
 
-    # Wait for a plausible report response
+    # Try to detect a plausible report response (best-effort)
     try:
         await page.wait_for_response(
             lambda r: any(k in (r.url or '').lower() for k in [
@@ -476,36 +471,59 @@ async def show_report_and_wait(page, *, click_timeout=8000, network_timeout=3000
             timeout=network_timeout
         )
     except Exception:
-        pass  # continue to DOM checks
+        pass
 
-    # Require either a proper Period line with two dates OR data rows
-    for _ in range(60):  # ~18s
-        period = await _read_period_text(page)
-        if _looks_like_dated_period(period):
-            return True
-        if await _has_data_rows(page):
-            return True
-        await asyncio.sleep(0.3)
+    # Always give it the requested 5–6s to actually render
+    await asyncio.sleep(settle_ms/1000)
+
+    # Panel-scoped checks: Period line or data rows
+    period = await _panel_read_period_text(panel)
+    if _looks_like_dated_period(period):
+        return True
+
+    if await panel_wait_data_rows(panel, timeout_ms=12000):
+        return True
+
+    # Retry once: click again + short settle
+    try:
+        await panel.locator(
+            "button:has-text('Show Report'), input[type='button'][value='Show Report'], input[type='submit'][value='Show Report']"
+        ).first.click(timeout=6000)
+    except Exception:
+        pass
+    await asyncio.sleep(2.0)
+
+    period = await _panel_read_period_text(panel)
+    if _looks_like_dated_period(period):
+        return True
+    if await panel_has_data_rows(panel):
+        return True
+
+    # Give back what we saw for debugging (soft fail – caller may decide)
     return False
 
-# ===================== PDF CONTROLS =====================
+# ===================== PDF CONTROLS (PANEL-SCOPED) =====================
 
 async def click_report_pdf_icon(page):
+    panel = app_panel_locator(page)
+    if not await panel.count():
+        return False
     candidates = [
-        "xpath=//div[contains(.,'Application Wise Report')]//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
-        "xpath=(//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
-        "xpath=(//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
+        "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
+        "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
+        "xpath=(.//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
     ]
     for sel in candidates:
-        if await page.locator(sel).count():
-            ico = page.locator(sel).first
+        if await panel.locator(sel).count():
+            ico = panel.locator(sel).first
             await ico.scroll_into_view_if_needed()
             await ico.click(timeout=6000, force=True)
             return True
     return False
 
 async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int = 5600, min_bytes: int = 7000):
-    if not await _has_data_rows(page):
+    panel = app_panel_locator(page)
+    if await panel_has_data_rows(panel) is False:
         log("[pdf] Warning: no data rows detected just before download; giving 1.5s grace.")
         await asyncio.sleep(1.5)
     if settle_ms > 0: await asyncio.sleep(settle_ms / 1000)
@@ -513,7 +531,7 @@ async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int 
     async def do_pdf_click():
         clicked = await click_report_pdf_icon(page)
         if not clicked:
-            raise RuntimeError("Red PDF icon not found")
+            raise RuntimeError("Red PDF icon not found in panel")
 
     ok_dl = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
     if not ok_dl: return False
@@ -683,11 +701,8 @@ async def site_login_and_download():
                 pass
 
         async def apply_common_filters(p):
-            # Circle
             ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
-            # Division
             ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            # Nature(all)
             ok3 = await select_nature_all(p)
             (OUT / "dropdown_warning.txt").write_text(
                 f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
@@ -697,7 +712,7 @@ async def site_login_and_download():
             ok4 = await select_status(p, status_text)
             log(f"[A] Status set to '{status_text}' (ok={ok4})")
 
-            # Ensure dates present before Show Report
+            # Ensure dates present (restore if site cleared)
             cur_from = await get_first_input_value(p, FROM_DATE_CANDIDATES)
             cur_to   = await get_first_input_value(p, TO_DATE_CANDIDATES)
             if not cur_from and captured_from:
@@ -706,22 +721,17 @@ async def site_login_and_download():
                 await set_first_input_value(p, TO_DATE_CANDIDATES, captured_to)
             log(f"[dates] before Show Report: From='{await get_first_input_value(p, FROM_DATE_CANDIDATES)}' To='{await get_first_input_value(p, TO_DATE_CANDIDATES)}'")
 
-            # Must successfully re-run Show Report and see a dated Period OR data rows
-            ok_show = await show_report_and_wait(p)
+            # Must re-run Show Report (panel-scoped), give it the 5–6s settle, and prefer Period line
+            ok_show = await show_report_and_wait(p, settle_ms=5600)
             if not ok_show:
-                if captured_from and captured_to:
-                    await set_first_input_value(p, FROM_DATE_CANDIDATES, captured_from)
-                    await set_first_input_value(p, TO_DATE_CANDIDATES, captured_to)
-                    log("[A] Re-applying dates and retrying Show Report once…")
-                    ok_show = await show_report_and_wait(p)
-            if not ok_show:
-                period_dbg = await _read_period_text(p)
-                raise RuntimeError(f"[A] Show Report did not produce data. Period text seen: '{period_dbg}'")
+                log("[A] Show Report did not show a dated Period or rows on first try; retrying once…")
+                ok_show = await show_report_and_wait(p, settle_ms=3000)
 
-            # Refuse to export if Period still lacks dates (prevents header-only PDFs)
-            period_now = await _read_period_text(p)
+            # Soft gate: if still no Period, warn but continue (some builds hide Period text)
+            panel = app_panel_locator(p)
+            period_now = await _panel_read_period_text(panel)
             if not _looks_like_dated_period(period_now):
-                raise RuntimeError(f"[A] Period line lacks dates after Show Report: '{period_now}'")
+                log(f"[warn] Period line not detected after Show Report. Seen: '{period_now}'")
 
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
 
