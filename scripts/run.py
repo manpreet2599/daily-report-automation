@@ -13,9 +13,27 @@ OUT.mkdir(exist_ok=True)
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-def today_str():
-    ist = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist).strftime("%d-%m-%Y")
+# === Date helpers ===
+IST = timezone(timedelta(hours=5, minutes=30))
+def today_ist():
+    return datetime.now(IST)
+
+def today_str_for_filename():
+    return today_ist().strftime("%d-%m-%Y")  # for file name only
+
+def ist_today_formats():
+    d = today_ist()
+    return (
+        d.strftime("%Y-%m-%d"),  # 2025-11-06
+        d.strftime("%d-%m-%Y"),  # 06-11-2025
+        d.strftime("%d/%m/%Y"),  # 06/11/2025
+    )
+
+FROM_FIXED_DATE_VARIANTS = (
+    "2024-07-26",  # matches your manual "Period: 2024-07-26"
+    "26-07-2024",
+    "26/07/2024",
+)
 
 def log(msg):
     print(msg, flush=True)
@@ -102,6 +120,27 @@ FAST_MULTISELECT_ALL_JS = """
     try { sel.dispatchEvent(new Event('changed.bs.select',{bubbles:true})); } catch(e) {}
   }
   return {ok:true};
+}
+"""
+
+DATE_FILL_JS = """
+(root, args) => {
+  const { fromVal, toVal } = args;
+  const setOne = (sel, v) => {
+    const el = root.querySelector(sel);
+    if (!el) return false;
+    el.value = v;
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+    try { el.dispatchEvent(new Event('changed.bs.select',{bubbles:true})); } catch(e) {}
+    return true;
+  };
+  let okFrom = false, okTo = false;
+  const fromCandidates = ['#fromDate','input[name="fromDate"]','input[name*="fromdate" i]','input[placeholder*="From" i]'];
+  const toCandidates   = ['#toDate','input[name="toDate"]','input[name*="todate" i]','input[placeholder*="To" i]'];
+  for (const c of fromCandidates) if (setOne(c, fromVal)) { okFrom = true; break; }
+  for (const c of toCandidates)   if (setOne(c, toVal))   { okTo = true; break; }
+  return {okFrom, okTo};
 }
 """
 
@@ -250,7 +289,7 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min
         log(f"[pdf] size: {size} bytes")
         if size < min_bytes:
             await asyncio.sleep(2.0)
-            ok2 = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
+            ok2 = await click_and_wait_download(panel.page, do_click, save_as_path=save_path, timeout_ms=35000)
             if not ok2:
                 return False
             size2 = Path(save_path).stat().st_size
@@ -261,6 +300,40 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min
         return False
     return True
 
+# ===================== DATES: TRY MULTIPLE FORMATS THEN SHOW REPORT =====================
+
+async def set_dates_and_show(panel, *, settle_ms_first=5600):
+    """
+    Try (from,to) in multiple formats:
+    - from: 2024-07-26 / 26-07-2024 / 26/07/2024
+    - to:   IST today in YYYY-MM-DD / DD-MM-YYYY / DD/MM/YYYY
+    After each attempt, click Show Report and check for rows.
+    Returns True if rows found.
+    """
+    to_variants = ist_today_formats()
+    tries = []
+    for f in FROM_FIXED_DATE_VARIANTS:
+        for t in to_variants:
+            tries.append((f, t))
+
+    for idx, (from_val, to_val) in enumerate(tries, start=1):
+        # Fill both dates inside panel
+        try:
+            res = await panel.evaluate(DATE_FILL_JS, {"fromVal": from_val, "toVal": to_val})
+            log(f"[dates] try {idx}: From='{from_val}' To='{to_val}' set={res}")
+        except Exception as e:
+            log(f"[dates] set error on try {idx}: {e}")
+
+        # Show Report and wait
+        has_rows = await show_report_and_wait(panel, settle_ms=settle_ms_first if idx == 1 else 3000, response_wait_ms=8000)
+        if has_rows:
+            log(f"[dates] data present with format try {idx}")
+            return True
+
+        log(f"[dates] no rows with try {idx}; trying next format…")
+
+    return False
+
 # ===================== MAIN =====================
 
 async def site_login_and_download():
@@ -268,7 +341,7 @@ async def site_login_and_download():
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
     user_type   = os.getenv("USER_TYPE", "").strip()
-    stamp       = today_str()
+    stamp       = today_str_for_filename()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -344,43 +417,20 @@ async def site_login_and_download():
         # Bind panel once
         panel = await get_app_panel(page)
 
-        # Capture dates (read-only; we won’t modify unless emptied by site)
-        captured_from = await panel_input_value(panel, [
-            "#fromDate","input#fromDate","input[name='fromDate']","input[name*='fromdate' i]","input[placeholder*='From' i]"
-        ])
-        captured_to = await panel_input_value(panel, [
-            "#toDate","input#toDate","input[name='toDate']","input[name*='todate' i]","input[placeholder*='To' i]"
-        ])
-        log(f"[dates] defaults (panel): From='{captured_from}' To='{captured_to}'")
-
         async def run_one(status_text: str, filename: str):
+            # Filters (panel-scoped, fast)
             await fast_select(panel, "Circle Office",   "LUDHIANA CANAL CIRCLE")
             await fast_select(panel, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION")
             await fast_select_all(panel, "Nature Of Application")
             await fast_select(panel, "Status", status_text)
 
-            # If site cleared dates, restore to defaults (but do not change otherwise)
-            if not await panel_input_value(panel, ["#fromDate","input[name='fromDate']"]):
-                await panel.evaluate(
-                    "(root, v)=>{const i=root.querySelector('#fromDate, input[name=\"fromDate\"]'); if(i){i.value=v; i.dispatchEvent(new Event('change',{bubbles:true}));}}",
-                    captured_from
-                )
-            if not await panel_input_value(panel, ["#toDate","input[name='toDate']"]):
-                await panel.evaluate(
-                    "(root, v)=>{const i=root.querySelector('#toDate, input[name=\"toDate\"]'); if(i){i.value=v; i.dispatchEvent(new Event('change',{bubbles:true}));}}",
-                    captured_to
-                )
-
-            log(f"[A] Show Report → {status_text}")
-            has_rows = await show_report_and_wait(panel, settle_ms=5600, response_wait_ms=8000)
-            if not has_rows:
-                log("[A] No rows after first try; retrying Show Report quickly…")
-                has_rows = await show_report_and_wait(panel, settle_ms=3000, response_wait_ms=5000)
-            if not has_rows:
-                raise RuntimeError(f"No data rows in panel after Show Report ({status_text}).")
+            # Set explicit date range (26/07/2024 → today) with multi-format fallback
+            ok_rows = await set_dates_and_show(panel, settle_ms_first=5600)
+            if not ok_rows:
+                raise RuntimeError(f"No data rows in panel after trying date formats ({status_text}).")
 
             await snap(page, f"after_grid_shown_{status_text.lower()}.png")
-            save_path = OUT / f"{filename} {today_str()}.pdf"
+            save_path = OUT / f"{filename} {stamp}.pdf"
             ok = await download_pdf_from_panel(panel, save_path, settle_ms=5600, min_bytes=7000)
             if not ok:
                 raise RuntimeError(f"Export produced a tiny PDF for {status_text}.")
@@ -424,3 +474,4 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         traceback.print_exc(); sys.exit(1)
+
