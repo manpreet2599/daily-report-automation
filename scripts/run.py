@@ -28,7 +28,47 @@ async def snap(page, name, full=False):
     except Exception:
         pass
 
-# ---------- NEW: DOM heuristic — confirm table has real data rows ----------
+# ---------- NEW: read/write helpers for inputs near labels ----------
+async def read_input_near_label(page, label_text: str) -> str:
+    try:
+        return await page.evaluate("""
+        (labelText)=>{
+          const norm = s => (s||'').trim().toLowerCase();
+          const L = Array.from(document.querySelectorAll('label'))
+              .find(l => norm(l.textContent).includes(norm(labelText)));
+          if (!L) return '';
+          const root = L.closest('div') || L.parentElement || document.body;
+          // try sibling input first
+          let inp = root.querySelector('input, .form-control input');
+          if (!inp && L.nextElementSibling && L.nextElementSibling.matches('input')) inp = L.nextElementSibling;
+          return (inp && (inp.value||'').trim()) || '';
+        }
+        """, label_text) or ""
+    except Exception:
+        return ""
+
+async def set_input_near_label(page, label_text: str, value: str) -> bool:
+    try:
+        return await page.evaluate("""
+        (labelText, val)=>{
+          const norm = s => (s||'').trim().toLowerCase();
+          const L = Array.from(document.querySelectorAll('label'))
+              .find(l => norm(l.textContent).includes(norm(labelText)));
+          if (!L) return false;
+          const root = L.closest('div') || L.parentElement || document.body;
+          let inp = root.querySelector('input, .form-control input');
+          if (!inp && L.nextElementSibling && L.nextElementSibling.matches('input')) inp = L.nextElementSibling;
+          if (!inp) return false;
+          inp.value = val;
+          inp.dispatchEvent(new Event('input', {bubbles:true}));
+          inp.dispatchEvent(new Event('change', {bubbles:true}));
+          return true;
+        }
+        """, label_text, value)
+    except Exception:
+        return False
+
+# ---------- data-row readiness checks ----------
 async def _has_data_rows(page):
     try:
         return await page.evaluate("""
@@ -51,7 +91,6 @@ async def _has_data_rows(page):
 
 async def _wait_for_data_rows(page, timeout_ms=30000):
     end = asyncio.get_event_loop().time() + timeout_ms/1000.0
-    # ensure a table exists first (any)
     try:
         await page.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
     except Exception:
@@ -274,11 +313,9 @@ async def select_circle(p, option_text: str):
     await snap(p, "after_select_circle.png")
     return ok
 
-# ⚡ Division selection: wait for the actual XHR + options growth (seconds, not minutes)
 async def select_division(p, option_text: str):
     log(f"[filter] Division Office → {option_text}")
 
-    # Try to locate the native select for Division near label
     label_selects = [
         "label:has-text('Division Office') + select",
         "xpath=//label[contains(normalize-space(),'Division Office')]/following::select[1]"
@@ -295,7 +332,6 @@ async def select_division(p, option_text: str):
                 native_sel = css
                 break
 
-    # Many sites fetch division list via AJAX; wait for that response OR options to increase.
     if native_sel:
         wait_resp = wait_for_any_response(
             p,
@@ -305,7 +341,7 @@ async def select_division(p, option_text: str):
         wait_opts = wait_options_increase(p, native_sel, min_count=2, timeout_ms=7000)
         await asyncio.gather(wait_resp, wait_opts)
 
-        for _ in range(50):  # up to ~5s, 100ms steps
+        for _ in range(50):
             try:
                 if await p.locator(f"{native_sel} >> option", has_text=option_text).count():
                     try:
@@ -318,7 +354,6 @@ async def select_division(p, option_text: str):
                 pass
             await asyncio.sleep(0.1)
 
-    # Bootstrap-select fallback
     ok = await _bootstrap_select(p, "Division Office", option_text)
     await _dump_near(p, "Division Office", "division")
     await snap(p, "after_select_division.png")
@@ -363,7 +398,6 @@ async def select_nature_all(p):
         await snap(p, "fail_nature.png")
         return False
 
-# Status with robustness: try native/contains, then bootstrap
 async def select_status(p, option_text: str):
     log(f"[filter] Status → {option_text}")
     ok, sel = await _native_select(
@@ -421,37 +455,27 @@ async def wait_for_report_table(p, timeout_ms=30000):
         except Exception:
             return False
 
-# ---------- UPDATED: after Show Report, ensure real data rows, not just header ----------
+# ---------- UPDATED: after Show Report, ensure real data rows ----------
 async def show_report_and_wait(page):
-    # Click the green Show Report
     await click_first(page, [
         "button:has-text('Show Report')",
         "input[type='button'][value='Show Report']",
         "text=Show Report"
     ], timeout=8000)
 
-    # Wait for at least one data row with non-empty cells
     ok = await _wait_for_data_rows(page, timeout_ms=30000)
     if not ok:
-        # Accept explicit "No record" message if present; else fail
         try:
             await page.get_by_text("No record", exact=False).wait_for(timeout=3000)
-            return  # no data case, but not an error
+            return
         except Exception:
             raise RuntimeError("Report table did not populate with data rows.")
 
-# ---------- click the red PDF icon directly under filters ----------
+# ---------- red PDF icon click ----------
 async def click_report_pdf_icon(page):
-    """
-    Click the red 'PDF' icon directly under the filters (your screenshot).
-    Avoids generic DataTables export button which yielded blank PDFs.
-    """
     candidates = [
-        # PDF icon inside the Application Wise Report panel
         "xpath=//div[contains(.,'Application Wise Report')]//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
-        # Any topmost PDF icon on the page as fallback
         "xpath=(//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
-        # Link wrapping the image
         "xpath=(//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
     ]
     for sel in candidates:
@@ -462,18 +486,12 @@ async def click_report_pdf_icon(page):
             return True
     return False
 
-# ---------- NEW: robust PDF download wrapper with settle + size check ----------
+# ---------- robust PDF download wrapper with settle + size check ----------
 async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int = 5600, min_bytes: int = 7000):
-    """
-    Wait an extra settle, click the red PDF icon, and verify file size.
-    If the file looks too small (likely header-only), retry once.
-    """
-    # Safety: ensure DOM still has data before we proceed
     if not await _has_data_rows(page):
         log("[pdf] Warning: no data rows detected just before download; giving 1.5s grace.")
         await asyncio.sleep(1.5)
 
-    # Your requested settle delay (5–6s) after grid is ready
     if settle_ms > 0:
         await asyncio.sleep(settle_ms / 1000)
 
@@ -482,7 +500,6 @@ async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int 
         if not clicked:
             raise RuntimeError("Red PDF icon not found")
 
-    # attempt 1
     ok_dl = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
     if not ok_dl:
         return False
@@ -514,11 +531,14 @@ async def site_login_and_download():
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
-    # final names you requested
     nameA       = "Delayed Apps"
     nameB       = "Pending Apps"
     user_type   = os.getenv("USER_TYPE", "").strip()
     stamp       = today_str()
+
+    # will be captured on page open, then restored before Show Report
+    captured_from = ""
+    captured_to   = ""
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -543,7 +563,7 @@ async def site_login_and_download():
         )
         context = await browser.new_context(accept_downloads=True)
 
-        # 🚀 Speedup: block heavy resources (images, fonts, CSS)
+        # block heavy resources (safe)
         async def speed_filter(route, request):
             rtype = request.resource_type
             if rtype in ("image", "stylesheet", "font"):
@@ -552,9 +572,8 @@ async def site_login_and_download():
                 await route.continue_()
         await context.route("**/*", speed_filter)
 
-        # timeouts
-        context.set_default_timeout(30000)               # actions: 30s
-        context.set_default_navigation_timeout(90000)    # nav: 1.5 min
+        context.set_default_timeout(30000)
+        context.set_default_navigation_timeout(90000)
 
         page = await context.new_page()
 
@@ -599,13 +618,14 @@ async def site_login_and_download():
             timeout=5000)
         log(f"Clicked login button? {clicked}")
 
-        # Avoid networkidle (may hang if the page keeps long polling)
         await page.wait_for_load_state("domcontentloaded", timeout=60000)
         await snap(page, "step3_after_login.png")
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
         async def open_application_wise(p):
+            nonlocal captured_from, captured_to
+
             log("[A] Opening 'MIS Reports'…")
             if not await click_first(p, [
                 "nav >> text=MIS Reports","text=MIS Reports","a:has-text('MIS Reports')",
@@ -642,34 +662,44 @@ async def site_login_and_download():
             await p.wait_for_load_state("domcontentloaded")
             await snap(p, "after_open_app_wise.png")
 
+            # ---------- NEW: capture default dates as soon as page opens ----------
+            captured_from = (await read_input_near_label(p, "From Date")) or ""
+            captured_to   = (await read_input_near_label(p, "To Date")) or ""
+            log(f"[dates] captured defaults: From='{captured_from}' To='{captured_to}'")
+
         async def apply_common_filters(p):
-            # Circle
             ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
-            # Division (fast reactive wait)
             ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            # Nature(all)
             ok3 = await select_nature_all(p)
             (OUT / "dropdown_warning.txt").write_text(
                 f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
             )
 
-        # ---------- UPDATED: strict "show report" & robust download ----------
+        # ---------- UPDATED: restore dates before Show Report, then download ----------
         async def set_status_and_download(p, status_text: str, save_path: Path):
             ok4 = await select_status(p, status_text)
             log(f"[A] Status set to '{status_text}' (ok={ok4})")
+
+            # If filters cleared dates, restore the captured defaults
+            cur_from = (await read_input_near_label(p, "From Date")) or ""
+            cur_to   = (await read_input_near_label(p, "To Date")) or ""
+            if not cur_from and captured_from:
+                await set_input_near_label(p, "From Date", captured_from)
+            if not cur_to and captured_to:
+                await set_input_near_label(p, "To Date", captured_to)
+            log(f"[dates] before Show Report: From='{await read_input_near_label(p,'From Date')}' To='{await read_input_near_label(p,'To Date')}'")
 
             log("[A] Clicking 'Show Report'…")
             await show_report_and_wait(p)
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
             log(f"[A] Report grid is visible ({status_text}).")
 
-            # robust download with your settle delay + size check
             log("[A] Downloading PDF via red icon with settle + verification…")
             ok_dl = await download_report_pdf_with_checks(
                 p,
                 save_path=save_path,
-                settle_ms=5600,     # ← your requested 5–6 seconds
-                min_bytes=7000      # adjust if your real PDFs are bigger/smaller
+                settle_ms=5600,
+                min_bytes=7000
             )
             if not ok_dl:
                 await snap(p, f"fail_pdf_click_{status_text.lower()}.png")
@@ -680,12 +710,10 @@ async def site_login_and_download():
         await open_application_wise(page)
         await apply_common_filters(page)
 
-        # Report A: DELAYED
         pathA = OUT / f"Delayed Apps {stamp}.pdf"
         await set_status_and_download(page, "DELAYED", pathA)
         log(f"Saved {pathA.name}")
 
-        # Report B: PENDING (toggle only Status)
         pathB = OUT / f"Pending Apps {stamp}.pdf"
         await set_status_and_download(page, "PENDING", pathB)
         log(f"Saved {pathB.name}")
