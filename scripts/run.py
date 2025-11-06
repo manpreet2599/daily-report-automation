@@ -310,7 +310,9 @@ async def render_panel_to_pdf(panel, pdf_path: Path):
     page = panel.page
     # Wrap the panel in a special container and inject @media print CSS
     await page.evaluate(
-        """(root, css) => {
+        """({ panelSelector, css }) => {
+            const panel = document.querySelector(panelSelector);
+            if (!panel) return;
             if (!document.getElementById('__print_only')) {
               document.head.insertAdjacentHTML('beforeend', css);
             }
@@ -318,15 +320,24 @@ async def render_panel_to_pdf(panel, pdf_path: Path):
             if (!document.getElementById(wrapId)) {
               const wrapper = document.createElement('div');
               wrapper.id = wrapId;
-              const p = root;
-              p.parentNode.insertBefore(wrapper, p);
-              wrapper.appendChild(p);
+              panel.parentNode.insertBefore(wrapper, panel);
+              wrapper.appendChild(panel);
             }
         }""",
-        panel, PRINT_INJECT_CSS
+        {
+            "panelSelector": await panel.evaluate("e => e.tagName === 'DIV' ? '#' + (e.id || '') : 'div'"),
+            "css": PRINT_INJECT_CSS,
+        }
     )
+
+    # Ensure print media and save PDF
     await page.emulate_media(media="print")
-    await page.pdf(path=str(pdf_path), format="A4", margin={"top":"8mm","right":"8mm","bottom":"8mm","left":"8mm"}, print_background=True)
+    await page.pdf(
+        path=str(pdf_path),
+        format="A4",
+        margin={"top": "8mm", "right": "8mm", "bottom": "8mm", "left": "8mm"},
+        print_background=True,
+    )
     log(f"[pdf:fallback] printed panel to → {pdf_path}")
 
 # ===================== DATES: TRY MULTIPLE FORMATS THEN SHOW REPORT =====================
