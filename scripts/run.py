@@ -24,69 +24,47 @@ async def snap(page, name, full=False):
     try: await page.screenshot(path=str(OUT / name), full_page=bool(full))
     except Exception: pass
 
-# ===================== DATE INPUT HELPERS =====================
+# ===================== PANEL FINDER =====================
+def app_panel(page):
+    # The unique wrapper that contains the report title + filters + buttons
+    return page.locator("xpath=//div[.//text()[contains(.,'Application Wise Report')]]").first
 
-FROM_DATE_CANDIDATES = [
-    "#fromDate", "input#fromDate", "input[name='fromDate']",
-    "input[name*='fromdate' i]", "input[placeholder*='From' i]",
-    "xpath=//label[contains(normalize-space(),'From Date')]/following::input[1]"
-]
-TO_DATE_CANDIDATES = [
-    "#toDate", "input#toDate", "input[name='toDate']",
-    "input[name*='todate' i]", "input[placeholder*='To' i]",
-    "xpath=//label[contains(normalize-space(),'To Date')]/following::input[1]"
-]
+# ===================== PANEL-SCOPED UTILITIES =====================
 
-async def get_first_input_value(p, candidates) -> str:
-    for sel in candidates:
+async def panel_click(panel, selectors, timeout=4000):
+    for sel in selectors:
         try:
-            loc = p.locator(sel).first
+            loc = panel.locator(sel).first
+            if await loc.count():
+                await loc.click(timeout=timeout)
+                return True
+        except Exception:
+            pass
+    return False
+
+async def panel_fill(panel, selectors, value):
+    for sel in selectors:
+        try:
+            loc = panel.locator(sel).first
+            if await loc.count():
+                await loc.fill(value)
+                try:
+                    await loc.evaluate("el => { el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }")
+                except Exception: pass
+                return True
+        except Exception:
+            pass
+    return False
+
+async def panel_input_value(panel, selectors) -> str:
+    for sel in selectors:
+        try:
+            loc = panel.locator(sel).first
             if await loc.count():
                 v = (await loc.input_value()).strip()
                 if v: return v
         except Exception: pass
     return ""
-
-async def set_first_input_value(p, candidates, value: str) -> bool:
-    for sel in candidates:
-        try:
-            loc = p.locator(sel).first
-            if await loc.count():
-                await loc.fill(value)
-                try:
-                    await p.eval_on_selector(sel, "el => { el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }")
-                except Exception: pass
-                return True
-        except Exception: pass
-    return False
-
-# ===================== PANEL HELPERS =====================
-
-def app_panel_locator(page):
-    # Narrow all actions to the Application Wise Report box/panel
-    return page.locator(
-        "xpath=//div[.//text()[contains(.,'Application Wise Report')]]"
-    ).first
-
-async def panel_has_data_rows(panel):
-    try:
-        return await panel.evaluate("""
-            (el) => {
-                const tbodies = Array.from(el.querySelectorAll('table tbody'));
-                for (const tb of tbodies) {
-                    const rows = Array.from(tb.querySelectorAll('tr'));
-                    const dataRows = rows.filter(r => {
-                        const tds = Array.from(r.querySelectorAll('td')).map(td => (td.innerText||'').trim());
-                        const nonEmpty = tds.filter(x => x && x !== '\\u00A0');
-                        return nonEmpty.length >= 2;
-                    });
-                    if (dataRows.length > 0) return true;
-                }
-                return false;
-            }
-        """)
-    except Exception:
-        return False
 
 async def panel_wait_data_rows(panel, timeout_ms=30000):
     end = asyncio.get_event_loop().time() + timeout_ms/1000.0
@@ -95,11 +73,242 @@ async def panel_wait_data_rows(panel, timeout_ms=30000):
     except Exception:
         pass
     while asyncio.get_event_loop().time() < end:
-        if await panel_has_data_rows(panel): return True
+        try:
+            has = await panel.evaluate("""
+                (el) => {
+                    const tbodies = Array.from(el.querySelectorAll('table tbody'));
+                    for (const tb of tbodies) {
+                        const rows = Array.from(tb.querySelectorAll('tr'));
+                        const dataRows = rows.filter(r => {
+                            const tds = Array.from(r.querySelectorAll('td')).map(td => (td.innerText||'').trim());
+                            const nonEmpty = tds.filter(x => x && x !== '\\u00A0');
+                            return nonEmpty.length >= 2;
+                        });
+                        if (dataRows.length > 0) return true;
+                    }
+                    return false;
+                }
+            """)
+            if has: return True
+        except Exception: pass
         await asyncio.sleep(0.3)
     return False
 
-# ===================== DOWNLOAD HELPERS =====================
+async def panel_read_period(panel) -> str:
+    try:
+        for sel in [
+            "xpath=.//*[contains(normalize-space(),'Period:')][1]",
+            "xpath=.//*[contains(@id,'period')][1]",
+            "xpath=.//div[contains(.,'Period:')][1]",
+        ]:
+            loc = panel.locator(sel).first
+            if await loc.count():
+                txt = (await loc.inner_text()).strip()
+                if txt: return " ".join(txt.split())
+    except Exception:
+        pass
+    return ""
+
+def looks_like_period(text: str) -> bool:
+    if not text or "period" not in text.lower(): return False
+    dates = re.findall(r"\b(\d{2,4}[-/]\d{1,2}[-/]\d{2,4})\b", text)
+    return len(dates) >= 2
+
+# ===================== PANEL-SCOPED SELECT HELPERS =====================
+
+async def panel_select_native(panel, label_text: str, option_text: str):
+    # try select immediately following the label, then id/name fallbacks inside panel
+    label_based = [
+        f"xpath=.//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
+        f"css=label:has-text('{label_text}') + select"
+    ]
+    id_name = [
+        "circle","circleId","circleOffice","circle_office",
+        "division","divisionId","divisionOffice",
+        "status","statusId","appStatus","applicationStatus"
+    ]
+    # label based
+    for sel in label_based:
+        sel_loc = panel.locator(sel).first
+        if await sel_loc.count():
+            try: await sel_loc.select_option(label=option_text); return True
+            except Exception:
+                try: await sel_loc.select_option(value=option_text); return True
+                except Exception: pass
+    # id/name inside panel
+    for key in id_name:
+        for css in (f"select#{key}", f"select[name='{key}']", f"select[name*='{key}']"):
+            sel_loc = panel.locator(css).first
+            if await sel_loc.count():
+                try: await sel_loc.select_option(label=option_text); return True
+                except Exception:
+                    try: await sel_loc.select_option(value=option_text); return True
+                    except Exception: pass
+    return False
+
+async def panel_select_bootstrap(panel, label_text: str, option_text: str):
+    toggles = [
+        f"xpath=.//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]",
+        f"xpath=.//button[contains(@class,'dropdown-toggle')][ancestor::div[label[contains(normalize-space(), '{label_text}')]]]"
+    ]
+    for tsel in toggles:
+        btn = panel.locator(tsel).first
+        if await btn.count():
+            try:
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                menu = panel.locator(".dropdown-menu.show, .show .dropdown-menu").first
+                await menu.wait_for(timeout=5000)
+                for _ in range(40):
+                    cand = menu.locator("li, a, span, .text").filter(has_text=option_text).first
+                    if await cand.count():
+                        await cand.scroll_into_view_if_needed()
+                        await cand.click(timeout=5000, force=True)
+                        try: await btn.press("Escape")
+                        except Exception: pass
+                        return True
+                    try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
+                    except Exception: pass
+                try: await btn.press("Escape")
+                except Exception: pass
+            except Exception:
+                try: await btn.press("Escape")
+                except Exception: pass
+    return False
+
+async def select_circle(panel, option_text: str):
+    log(f"[filter] Circle Office → {option_text}")
+    if await panel_select_native(panel, "Circle Office", option_text): return True
+    return await panel_select_bootstrap(panel, "Circle Office", option_text)
+
+async def select_division(panel, option_text: str):
+    log(f"[filter] Division Office → {option_text}")
+    if await panel_select_native(panel, "Division Office", option_text): return True
+    return await panel_select_bootstrap(panel, "Division Office", option_text)
+
+async def select_status(panel, option_text: str):
+    log(f"[filter] Status → {option_text}")
+    if await panel_select_native(panel, "Status", option_text): return True
+    return await panel_select_bootstrap(panel, "Status", option_text)
+
+async def select_nature_all(panel):
+    log(f"[filter] Nature Of Application → Select all (force)")
+    js = """
+    (root) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(root.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes('nature of application'));
+      if (!L) return { ok:false, reason:'label not found' };
+      const box = L.closest('div') || root;
+      let sel = box.querySelector('select');
+      if (!sel) {
+        const cands = Array.from(box.querySelectorAll('select'));
+        sel = cands[0] || null;
+      }
+      if (!sel) return { ok:false, reason:'select not found' };
+      let changed=false;
+      for (const o of sel.options) { if (!o.selected){ o.selected=true; changed=true; } }
+      if (changed) {
+        sel.dispatchEvent(new Event('input',{bubbles:true}));
+        sel.dispatchEvent(new Event('change',{bubbles:true}));
+      }
+      return { ok:true };
+    }
+    """
+    try:
+        res = await panel.evaluate(js)
+        return bool(res and res.get("ok"))
+    except Exception:
+        return False
+
+# ===================== SHOW REPORT (PANEL-SCOPED) =====================
+
+async def show_report_and_wait(page, *, settle_ms=5600, network_timeout=30000):
+    panel = app_panel(page)
+    if not await panel.count():
+        raise RuntimeError("Application Wise Report panel not found")
+
+    # Click Show Report inside panel
+    clicked = False
+    try:
+        clicked = await panel_click(panel, [
+            "button:has-text('Show Report')",
+            "input[type='button'][value='Show Report']",
+            "input[type='submit'][value='Show Report']",
+        ], timeout=8000)
+        if not clicked:
+            clicked = await panel.evaluate("""
+            (root)=>{
+              const norm = s => (s||'').trim().toLowerCase();
+              const btns = Array.from(root.querySelectorAll('button,input[type=button],input[type=submit]'));
+              const b = btns.find(x => {
+                const t = norm(x.innerText||x.value||'');
+                return t === 'show report' || t.includes('show report');
+              });
+              if (!b) return false;
+              b.click();
+              return true;
+            }
+            """)
+    except Exception:
+        clicked = False
+    if not clicked:
+        raise RuntimeError("Could not click Show Report")
+
+    # Try to catch a report-like response (best-effort)
+    try:
+        await page.wait_for_response(
+            lambda r: any(k in (r.url or '').lower() for k in [
+                "applicationwisereport","appwisereport","getreport","reportdata","report"
+            ]) and r.ok,
+            timeout=network_timeout
+        )
+    except Exception:
+        pass
+
+    # Give it time to render (your requested delay)
+    await asyncio.sleep(settle_ms/1000)
+
+    # Panel-scoped checks
+    period = await panel_read_period(panel)
+    if looks_like_period(period):
+        return True
+
+    if await panel_wait_data_rows(panel, timeout_ms=12000):
+        return True
+
+    # Retry once (short)
+    await asyncio.sleep(1.5)
+    try:
+        await panel_click(panel, [
+            "button:has-text('Show Report')",
+            "input[type='button'][value='Show Report']",
+            "input[type='submit'][value='Show Report']",
+        ], timeout=6000)
+    except Exception:
+        pass
+    await asyncio.sleep(2.0)
+    period = await panel_read_period(panel)
+    if looks_like_period(period): return True
+    if await panel_wait_data_rows(panel, timeout_ms=6000): return True
+    return False
+
+# ===================== PDF (PANEL-SCOPED) =====================
+
+async def click_report_pdf_icon(page):
+    panel = app_panel(page)
+    if not await panel.count(): return False
+    for sel in [
+        "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
+        "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
+        "xpath=(.//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
+    ]:
+        ico = panel.locator(sel).first
+        if await ico.count():
+            await ico.scroll_into_view_if_needed()
+            await ico.click(timeout=6000, force=True)
+            return True
+    return False
 
 async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=35000):
     log("[pdf] trying direct download…")
@@ -132,401 +341,18 @@ async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=35000):
             log(f"[pdf] popup fallback failed: {e2}")
             return False
 
-# ===================== GENERIC UI HELPERS =====================
-
-async def fill_first(page, candidates, value):
-    for sel in candidates:
-        try:
-            if await page.locator(sel).count():
-                await page.fill(sel, value); return True
-        except Exception: pass
-    return False
-
-async def click_first(page, candidates, timeout=3000):
-    for sel in candidates:
-        try:
-            if await page.locator(sel).count():
-                await page.locator(sel).first.click(timeout=timeout); return True
-        except Exception: pass
-    return False
-
-async def _dump_near(p, label_text: str, tag: str):
-    if not DEBUG: return
-    try:
-        html = await p.evaluate(
-            """(txt)=>{
-              const L=[...document.querySelectorAll('label')].find(l=>(l.textContent||'').trim().toLowerCase().includes(txt.toLowerCase()));
-              const el=L?.closest('div')||L?.parentElement||document.body;
-              return (el?.outerHTML||'').slice(0,8000);
-            }""", label_text
-        )
-        (OUT / f"debug_near_{tag}.html").write_text(html or "", encoding="utf-8")
-    except Exception: pass
-
-# ===================== SELECT HELPERS (native + bootstrap) =====================
-
-def _resp_matcher(substrings):
-    low = [s.lower() for s in substrings]
-    def _inner(resp):
-        try:
-            url = resp.url.lower()
-            return any(s in url for s in low)
-        except Exception:
-            return False
-    return _inner
-
-async def wait_for_any_response(p, substrings, timeout_ms=10000):
-    try:
-        await p.wait_for_response(_resp_matcher(substrings), timeout=timeout_ms)
-        return True
-    except Exception:
-        return False
-
-async def get_options_count(p, select_css: str):
-    try:
-        return await p.eval_on_selector(select_css, "s => s ? s.options.length : 0")
-    except Exception:
-        return 0
-
-async def wait_options_increase(p, select_css: str, min_count=2, timeout_ms=8000):
-    end = asyncio.get_event_loop().time() + timeout_ms/1000.0
-    while asyncio.get_event_loop().time() < end:
-        cnt = await get_options_count(p, select_css)
-        if cnt >= min_count: return True
-        await asyncio.sleep(0.1)
-    return False
-
-async def _native_select(p, label_text: str, id_candidates, name_candidates, option_text: str):
-    label_based = [
-        f"label:has-text('{label_text}') + select",
-        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
-        f"text={label_text} >> xpath=following::select[1]",
-    ]
-    for sel in label_based:
-        if await p.locator(sel).count():
-            try:
-                await p.select_option(sel, label=option_text); return True, sel
-            except Exception:
-                try:
-                    await p.select_option(sel, value=option_text); return True, sel
-                except Exception: pass
-    for key in id_candidates:
-        sel = f"select#{key}"
-        if await p.locator(sel).count():
-            try:
-                await p.select_option(sel, label=option_text); return True, sel
-            except Exception:
-                try:
-                    await p.select_option(sel, value=option_text); return True, sel
-                except Exception: pass
-    for key in name_candidates:
-        sel = f"select[name='{key}'], select[name*='{key}']"
-        if await p.locator(sel).count():
-            try:
-                await p.select_option(sel, label=option_text); return True, sel
-            except Exception:
-                try:
-                    await p.select_option(sel, value=option_text); return True, sel
-                except Exception: pass
-    return False, None
-
-async def _bootstrap_select(p, label_text: str, option_text: str):
-    toggle_candidates = [
-        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]",
-        f"label:has-text('{label_text}') + * button.dropdown-toggle",
-        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::button[contains(@class,'dropdown-toggle')][1]",
-    ]
-    for tsel in toggle_candidates:
-        if await p.locator(tsel).count():
-            try:
-                btn = p.locator(tsel).first
-                await btn.scroll_into_view_if_needed()
-                await btn.click()
-                menu = p.locator(".dropdown-menu.show, .show .dropdown-menu").first
-                await menu.wait_for(timeout=5000)
-                found = False
-                for _ in range(30):
-                    candidate = menu.locator("li, a, span, .text").filter(has_text=option_text).first
-                    if await candidate.count():
-                        await candidate.scroll_into_view_if_needed()
-                        await candidate.click(timeout=5000, force=True)
-                        found = True
-                        break
-                    try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
-                    except Exception: pass
-                try: await p.keyboard.press("Escape")
-                except Exception: pass
-                if found: return True
-            except Exception:
-                try: await p.keyboard.press("Escape")
-                except Exception: pass
-    return False
-
-async def select_circle(p, option_text: str):
-    log(f"[filter] Circle Office → {option_text}")
-    ok, sel = await _native_select(
-        p, "Circle Office",
-        id_candidates=["circle", "circleId", "circleOffice", "circle_office"],
-        name_candidates=["circle", "circleId", "circleOffice", "circle_office"],
-        option_text=option_text
-    )
-    if ok:
-        await snap(p, "after_select_circle.png")
-        return True
-    ok = await _bootstrap_select(p, "Circle Office", option_text)
-    await _dump_near(p, "Circle Office", "circle")
-    await snap(p, "after_select_circle.png")
-    return ok
-
-async def select_division(p, option_text: str):
-    log(f"[filter] Division Office → {option_text}")
-    label_selects = [
-        "label:has-text('Division Office') + select",
-        "xpath=//label[contains(normalize-space(),'Division Office')]/following::select[1]"
-    ]
-    native_sel = None
-    for css in label_selects:
-        if await p.locator(css).count():
-            native_sel = css
-            break
-    if not native_sel:
-        for css in ["select#division","select#divisionId","select#divisionOffice",
-                    "select[name='division']","select[name*='division']"]:
-            if await p.locator(css).count():
-                native_sel = css
-                break
-
-    if native_sel:
-        wait_resp = wait_for_any_response(
-            p,
-            substrings=["division", "getDivision", "bycircle", "divisionList", "getdivisions"],
-            timeout_ms=7000
-        )
-        wait_opts = wait_options_increase(p, native_sel, min_count=2, timeout_ms=7000)
-        await asyncio.gather(wait_resp, wait_opts)
-
-        for _ in range(50):
-            try:
-                if await p.locator(f"{native_sel} >> option", has_text=option_text).count():
-                    try:
-                        await p.select_option(native_sel, label=option_text)
-                    except Exception:
-                        await p.select_option(native_sel, value=option_text)
-                    await snap(p, "after_select_division.png")
-                    return True
-            except Exception:
-                pass
-            await asyncio.sleep(0.1)
-
-    ok = await _bootstrap_select(p, "Division Office", option_text)
-    await _dump_near(p, "Division Office", "division")
-    await snap(p, "after_select_division.png")
-    return ok
-
-async def select_nature_all(p):
-    log(f"[filter] Nature Of Application → Select all (force)")
-    js = """
-    (labelText) => {
-      const norm = s => (s||'').trim().toLowerCase();
-      const L = Array.from(document.querySelectorAll('label'))
-        .find(l => norm(l.textContent).includes(norm(labelText)));
-      if (!L) return { ok:false, reason:'label not found' };
-      const root = L.closest('div') || L.parentElement || document.body;
-      let sel = root.querySelector('select');
-      if (!sel) {
-        sel = (L.nextElementSibling && L.nextElementSibling.matches('select')) ? L.nextElementSibling : null;
-        if (!sel) {
-          const candidates = Array.from(root.querySelectorAll('select'));
-          sel = candidates.length ? candidates[0] : null;
-        }
-      }
-      if (!sel) return { ok:false, reason:'select not found' };
-      let changed = false;
-      for (const o of sel.options) {
-        if (!o.selected) { o.selected = true; changed = true; }
-      }
-      if (changed) {
-        sel.dispatchEvent(new Event('input',  { bubbles:true }));
-        sel.dispatchEvent(new Event('change', { bubbles:true }));
-      }
-      return { ok:true };
-    }
-    """
-    try:
-        res = await p.evaluate(js, "Nature Of Application")
-        await snap(p, "after_select_nature.png")
-        return bool(res.get("ok"))
-    except Exception:
-        await snap(p, "fail_nature.png")
-        return False
-
-async def select_status(p, option_text: str):
-    log(f"[filter] Status → {option_text}")
-    ok, sel = await _native_select(
-        p, "Status",
-        id_candidates=["status","statusId","appStatus","applicationStatus"],
-        name_candidates=["status","statusId","appStatus","applicationStatus"],
-        option_text=option_text
-    )
-    if ok:
-        await snap(p, "after_select_status.png")
-        return True
-
-    js = """
-    (wanted) => {
-      const norm = s => (s||'').trim().toLowerCase();
-      const L = Array.from(document.querySelectorAll('label'))
-        .find(l => norm(l.textContent).includes('status'));
-      if (!L) return false;
-      const root = L.closest('div') || L.parentElement || document.body;
-      const sel = root.querySelector('select');
-      if (!sel) return false;
-      const w = norm(wanted);
-      let idx = -1;
-      for (let i=0;i<sel.options.length;i++){
-        const txt = norm(sel.options[i].textContent);
-        if (txt.includes(w)) { idx = i; break; }
-      }
-      if (idx === -1) return false;
-      sel.selectedIndex = idx;
-      sel.dispatchEvent(new Event('input', {bubbles:true}));
-      sel.dispatchEvent(new Event('change', {bubbles:true}));
-      return true;
-    }
-    """
-    try:
-        ok2 = await p.evaluate(js, option_text)
-        await snap(p, "after_select_status.png")
-        return bool(ok2)
-    except Exception:
-        pass
-
-    ok = await _bootstrap_select(p, "Status", option_text)
-    await _dump_near(p, "Status", "status")
-    await snap(p, "after_select_status.png")
-    return ok
-
-# ===================== PERIOD + SHOW REPORT (PANEL-SCOPED) =====================
-
-async def _panel_read_period_text(panel) -> str:
-    try:
-        sel_candidates = [
-            "xpath=.//*[contains(normalize-space(),'Period:')][1]",
-            "xpath=.//*[contains(@id,'period')][1]",
-            "xpath=.//div[contains(.,'Period:')][1]",
-        ]
-        for s in sel_candidates:
-            if await panel.locator(s).count():
-                txt = (await panel.locator(s).first.inner_text()).strip()
-                if txt:
-                    return " ".join(txt.split())
-    except Exception:
-        pass
-    return ""
-
-def _looks_like_dated_period(text: str) -> bool:
-    if not text: return False
-    if "period" not in text.lower(): return False
-    dates = re.findall(r"\b(\d{2,4}[-/]\d{1,2}[-/]\d{2,4})\b", text)
-    return len(dates) >= 2
-
-async def show_report_and_wait(page, *, settle_ms=5600, network_timeout=30000):
-    panel = app_panel_locator(page)
-    if not await panel.count():
-        raise RuntimeError("Application Wise Report panel not found")
-
-    # Click the Show Report inside the panel
-    clicked = False
-    try:
-        clicked = await panel.locator(
-            "button:has-text('Show Report'), input[type='button'][value='Show Report'], input[type='submit'][value='Show Report']"
-        ).first.click(timeout=8000) or True
-    except Exception:
-        # JS fallback limited to panel
-        try:
-            clicked = await panel.evaluate("""
-            (el)=>{
-              const norm = s => (s||'').trim().toLowerCase();
-              const btns = Array.from(el.querySelectorAll('button,input[type=button],input[type=submit]'));
-              const b = btns.find(x => {
-                const t = norm(x.innerText||x.value||'');
-                return t === 'show report' || t.includes('show report');
-              });
-              if (!b) return false;
-              b.click();
-              return true;
-            }
-            """)
-        except Exception:
-            clicked = False
-    if not clicked:
-        raise RuntimeError("Could not click Show Report")
-
-    # Try to detect a plausible report response (best-effort)
-    try:
-        await page.wait_for_response(
-            lambda r: any(k in (r.url or '').lower() for k in [
-                "applicationwisereport", "appwisereport", "getreport", "reportdata", "report"
-            ]) and r.ok,
-            timeout=network_timeout
-        )
-    except Exception:
-        pass
-
-    # Always give it the requested 5–6s to actually render
-    await asyncio.sleep(settle_ms/1000)
-
-    # Panel-scoped checks: Period line or data rows
-    period = await _panel_read_period_text(panel)
-    if _looks_like_dated_period(period):
-        return True
-
-    if await panel_wait_data_rows(panel, timeout_ms=12000):
-        return True
-
-    # Retry once: click again + short settle
-    try:
-        await panel.locator(
-            "button:has-text('Show Report'), input[type='button'][value='Show Report'], input[type='submit'][value='Show Report']"
-        ).first.click(timeout=6000)
-    except Exception:
-        pass
-    await asyncio.sleep(2.0)
-
-    period = await _panel_read_period_text(panel)
-    if _looks_like_dated_period(period):
-        return True
-    if await panel_has_data_rows(panel):
-        return True
-
-    # Give back what we saw for debugging (soft fail – caller may decide)
-    return False
-
-# ===================== PDF CONTROLS (PANEL-SCOPED) =====================
-
-async def click_report_pdf_icon(page):
-    panel = app_panel_locator(page)
-    if not await panel.count():
-        return False
-    candidates = [
-        "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
-        "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
-        "xpath=(.//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
-    ]
-    for sel in candidates:
-        if await panel.locator(sel).count():
-            ico = panel.locator(sel).first
-            await ico.scroll_into_view_if_needed()
-            await ico.click(timeout=6000, force=True)
-            return True
-    return False
-
 async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int = 5600, min_bytes: int = 7000):
-    panel = app_panel_locator(page)
-    if await panel_has_data_rows(panel) is False:
-        log("[pdf] Warning: no data rows detected just before download; giving 1.5s grace.")
+    panel = app_panel(page)
+    try:
+        has_rows = await panel_wait_data_rows(panel, timeout_ms=1000)
+    except Exception:
+        has_rows = False
+    if not has_rows:
+        log("[pdf] Warning: no data rows detected just before download; grace 1.5s.")
         await asyncio.sleep(1.5)
-    if settle_ms > 0: await asyncio.sleep(settle_ms / 1000)
+
+    if settle_ms > 0:
+        await asyncio.sleep(settle_ms / 1000)
 
     async def do_pdf_click():
         clicked = await click_report_pdf_icon(page)
@@ -540,7 +366,7 @@ async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int 
         size = Path(save_path).stat().st_size
         log(f"[pdf] size: {size} bytes")
         if size < min_bytes:
-            log("[pdf] File looks too small; retrying once after 3s…")
+            log("[pdf] File looks too small; retry once after 3s…")
             await asyncio.sleep(3.0)
             ok_dl2 = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
             if not ok_dl2: return False
@@ -583,10 +409,9 @@ async def site_login_and_download():
         )
         context = await browser.new_context(accept_downloads=True)
 
-        # keep css/images to avoid breaking date widgets; only block fonts
+        # Only block fonts; keep CSS/images so widgets behave
         async def speed_filter(route, request):
-            rtype = request.resource_type
-            if rtype in ("font",):
+            if request.resource_type in ("font",):
                 await route.abort()
             else:
                 await route.continue_()
@@ -594,33 +419,7 @@ async def site_login_and_download():
 
         context.set_default_timeout(30000)
         context.set_default_navigation_timeout(90000)
-
         page = await context.new_page()
-
-        # Guard: auto-restore dates if site JS clears them
-        await page.add_init_script("""
-        (function(){
-          window.__keepDates = {from:'', to:''};
-          const setBack = () => {
-            const f = document.querySelector('#fromDate, input[name="fromDate"], input[name*="fromdate" i], input[placeholder*="From" i]');
-            const t = document.querySelector('#toDate, input[name="toDate"], input[name*="todate" i], input[placeholder*="To" i]');
-            if (f && window.__keepDates.from && !f.value) {
-              f.value = window.__keepDates.from;
-              f.dispatchEvent(new Event('input',{bubbles:true}));
-              f.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-            if (t && window.__keepDates.to && !t.value) {
-              t.value = window.__keepDates.to;
-              t.dispatchEvent(new Event('input',{bubbles:true}));
-              t.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-          };
-          const mo = new MutationObserver(setBack);
-          document.addEventListener('DOMContentLoaded', setBack);
-          mo.observe(document.documentElement, {subtree:true, childList:true, attributes:true});
-          setInterval(setBack, 500);
-        })();
-        """)
 
         # ---- Login ----
         log(f"Opening login page: {login_url}")
@@ -638,47 +437,32 @@ async def site_login_and_download():
                     except Exception:
                         try: await page.select_option(sel, label=user_type); break
                         except Exception: pass
-        await snap(page, "after_user_type.png")
 
-        await fill_first(page,
-            ["input[name='username']", "#username", "input[name='login']", "#login",
-             "input[name='userid']", "#userid", "#loginid", "input[name='loginid']",
-             "input[placeholder*='Email']", "input[placeholder*='Mobile']", "input[placeholder*='Login']"],
-            username)
-        await fill_first(page,
-            ["input[name='password']", "#password", "input[name='pwd']", "#pwd", "input[placeholder='Password']"],
-            password)
-        await snap(page, "step2_before_login.png")
-
-        await click_first(page,
-            ["button:has-text('Login')","button:has-text('Sign in')",
-             "button[type='submit']","[role='button']:has-text('Login')"], timeout=5000)
+        await panel_fill(page, ["#username","input[name='username']","input[placeholder*='Login']","input[placeholder*='Email']"], username)
+        await panel_fill(page, ["#password","input[name='password']","input[name='pwd']"], password)
+        await panel_click(page, ["button:has-text('Login')","button[type='submit']","[role='button']:has-text('Login')"], timeout=5000)
 
         await page.wait_for_load_state("domcontentloaded", timeout=60000)
-        await snap(page, "step3_after_login.png")
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
         # ---- Navigate to Application Wise Report ----
         async def open_application_wise(p):
-            nonlocal captured_from, captured_to
-
             log("[A] Opening 'MIS Reports'…")
-            if not await click_first(p, [
+            ok = await panel_click(p, [
                 "nav >> text=MIS Reports","text=MIS Reports","a:has-text('MIS Reports')",
                 "[role='menuitem']:has-text('MIS Reports')","button:has-text('MIS Reports')","li:has-text('MIS Reports')"
-            ], timeout=3000):
+            ], timeout=3000)
+            if not ok:
                 await p.get_by_text("MIS Reports", exact=False).first.click()
             await p.wait_for_timeout(150)
-            await snap(p, "after_open_mis.png")
 
             log("[A] Clicking 'Application Wise Report'…")
-            ok = await click_first(p, [
+            ok = await panel_click(p, [
                 "text=Application Wise Report","a:has-text('Application Wise Report')",
                 "[role='menuitem']:has-text('Application Wise Report')","li:has-text('Application Wise Report')"
             ], timeout=6000)
             if not ok:
-                await snap(p, "fail_open_app_wise.png")
                 raise RuntimeError("[A] Could not open 'Application Wise Report'")
 
             try:
@@ -687,75 +471,74 @@ async def site_login_and_download():
                 await p.get_by_text("Application Wise Report", exact=False).wait_for(timeout=12000)
 
             await p.wait_for_load_state("domcontentloaded")
-            await snap(p, "after_open_app_wise.png")
 
-            # Capture default dates precisely
-            captured_from = await get_first_input_value(p, FROM_DATE_CANDIDATES)
-            captured_to   = await get_first_input_value(p, TO_DATE_CANDIDATES)
+        async def capture_panel_defaults(p):
+            panel_el = app_panel(p)
+            if not await panel_el.count():
+                raise RuntimeError("Application Wise Report panel not found")
+            # Capture default dates **inside** the panel
+            nonlocal captured_from, captured_to
+            captured_from = await panel_input_value(panel_el, [
+                "#fromDate","input#fromDate","input[name='fromDate']","input[name*='fromdate' i]","input[placeholder*='From' i]"
+            ])
+            captured_to = await panel_input_value(panel_el, [
+                "#toDate","input#toDate","input[name='toDate']","input[name*='todate' i]","input[placeholder*='To' i]"
+            ])
             log(f"[dates] captured defaults: From='{captured_from}' To='{captured_to}'")
 
-            # Feed guard so any clears are auto-restored
-            try:
-                await p.evaluate("(f,t)=>{window.__keepDates.from=f; window.__keepDates.to=t;}", captured_from, captured_to)
-            except Exception:
-                pass
+        async def apply_filters_and_download(p, status_text: str, save_path: Path):
+            panel_el = app_panel(p)
+            if not await panel_el.count():
+                raise RuntimeError("Application Wise Report panel not found")
 
-        async def apply_common_filters(p):
-            ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
-            ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
-            ok3 = await select_nature_all(p)
-            (OUT / "dropdown_warning.txt").write_text(
-                f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
-            )
+            # Selects are now strictly panel-scoped
+            await select_circle(panel_el, "LUDHIANA CANAL CIRCLE")
+            await select_division(panel_el, "FARIDKOT CANAL AND GROUND WATER DIVISION")
+            await select_nature_all(panel_el)
+            await select_status(panel_el, status_text)
+            log(f"[A] Status set to '{status_text}'")
 
-        async def set_status_and_download(p, status_text: str, save_path: Path):
-            ok4 = await select_status(p, status_text)
-            log(f"[A] Status set to '{status_text}' (ok={ok4})")
+            # Ensure dates are present inside panel
+            frm = await panel_input_value(panel_el, ["#fromDate","input[name='fromDate']","input[name*='fromdate' i]","input[placeholder*='From' i]"])
+            to  = await panel_input_value(panel_el, ["#toDate","input[name='toDate']","input[name*='todate' i]","input[placeholder*='To' i]"])
+            if (not frm and captured_from): await panel_fill(panel_el, ["#fromDate","input[name='fromDate']","input[name*='fromdate' i]","input[placeholder*='From' i]"], captured_from)
+            if (not to  and captured_to  ): await panel_fill(panel_el, ["#toDate","input[name='toDate']","input[name*='todate' i]","input[placeholder*='To' i]"], captured_to)
+            frm2 = await panel_input_value(panel_el, ["#fromDate","input[name='fromDate']","input[name*='fromdate' i]","input[placeholder*='From' i]"])
+            to2  = await panel_input_value(panel_el, ["#toDate","input[name='toDate']","input[name*='todate' i]","input[placeholder*='To' i]"])
+            log(f"[dates] before Show Report (panel): From='{frm2}' To='{to2}'")
 
-            # Ensure dates present (restore if site cleared)
-            cur_from = await get_first_input_value(p, FROM_DATE_CANDIDATES)
-            cur_to   = await get_first_input_value(p, TO_DATE_CANDIDATES)
-            if not cur_from and captured_from:
-                await set_first_input_value(p, FROM_DATE_CANDIDATES, captured_from)
-            if not cur_to and captured_to:
-                await set_first_input_value(p, TO_DATE_CANDIDATES, captured_to)
-            log(f"[dates] before Show Report: From='{await get_first_input_value(p, FROM_DATE_CANDIDATES)}' To='{await get_first_input_value(p, TO_DATE_CANDIDATES)}'")
-
-            # Must re-run Show Report (panel-scoped), give it the 5–6s settle, and prefer Period line
             ok_show = await show_report_and_wait(p, settle_ms=5600)
             if not ok_show:
-                log("[A] Show Report did not show a dated Period or rows on first try; retrying once…")
+                log("[A] Show Report did not render; retry with short settle.")
                 ok_show = await show_report_and_wait(p, settle_ms=3000)
 
-            # Soft gate: if still no Period, warn but continue (some builds hide Period text)
-            panel = app_panel_locator(p)
-            period_now = await _panel_read_period_text(panel)
-            if not _looks_like_dated_period(period_now):
-                log(f"[warn] Period line not detected after Show Report. Seen: '{period_now}'")
+            # Proceed if we have either Period w/ dates or real rows
+            period = await panel_read_period(panel_el)
+            if looks_like_period(period):
+                log(f"[period] {period}")
+            else:
+                # check rows to avoid empty export
+                has_rows = await panel_wait_data_rows(panel_el, timeout_ms=3000)
+                if not has_rows:
+                    raise RuntimeError("[A] No data rows detected in panel after Show Report; aborting export.")
 
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
 
-            ok_dl = await download_report_pdf_with_checks(
-                p,
-                save_path=save_path,
-                settle_ms=5600,
-                min_bytes=7000
-            )
+            ok_dl = await download_report_pdf_with_checks(p, save_path=save_path, settle_ms=5600, min_bytes=7000)
             if not ok_dl:
-                await snap(p, f"fail_pdf_click_{status_text.lower()}.png")
                 raise RuntimeError(f"[A] Could not obtain a valid PDF ({status_text})")
             log(f"[A] PDF saved → {save_path}")
 
         # === Flow ===
         await open_application_wise(page)
-        await apply_common_filters(page)
+        await capture_panel_defaults(page)
 
         pathA = OUT / f"Delayed Apps {stamp}.pdf"
-        await set_status_and_download(page, "DELAYED", pathA)
+        await apply_filters_and_download(page, "DELAYED", pathA)
         log(f"Saved {pathA.name}")
 
         pathB = OUT / f"Pending Apps {stamp}.pdf"
-        await set_status_and_download(page, "PENDING", pathB)
+        await apply_filters_and_download(page, "PENDING", pathB)
         log(f"Saved {pathB.name}")
 
         await context.close(); await browser.close()
