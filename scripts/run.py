@@ -28,6 +28,40 @@ async def snap(page, name, full=False):
     except Exception:
         pass
 
+# ---------- NEW: DOM heuristic — confirm table has real data rows ----------
+async def _has_data_rows(page):
+    try:
+        return await page.evaluate("""
+            () => {
+                const tbodies = Array.from(document.querySelectorAll('table tbody'));
+                for (const tb of tbodies) {
+                    const rows = Array.from(tb.querySelectorAll('tr'));
+                    const dataRows = rows.filter(r => {
+                        const tds = Array.from(r.querySelectorAll('td')).map(td => (td.innerText||'').trim());
+                        const nonEmpty = tds.filter(x => x && x !== '\\u00A0');
+                        return nonEmpty.length >= 2;
+                    });
+                    if (dataRows.length > 0) return true;
+                }
+                return false;
+            }
+        """)
+    except Exception:
+        return False
+
+async def _wait_for_data_rows(page, timeout_ms=30000):
+    end = asyncio.get_event_loop().time() + timeout_ms/1000.0
+    # ensure a table exists first (any)
+    try:
+        await page.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
+    except Exception:
+        pass
+    while asyncio.get_event_loop().time() < end:
+        if await _has_data_rows(page):
+            return True
+        await asyncio.sleep(0.3)
+    return False
+
 # ---------------- PDF download (bounded; popup fallback) ----------------
 async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=35000):
     log("[pdf] trying direct download…")
@@ -387,7 +421,7 @@ async def wait_for_report_table(p, timeout_ms=30000):
         except Exception:
             return False
 
-# ---------- NEW: after Show Report, ensure rows (not just header) ----------
+# ---------- UPDATED: after Show Report, ensure real data rows, not just header ----------
 async def show_report_and_wait(page):
     # Click the green Show Report
     await click_first(page, [
@@ -396,22 +430,17 @@ async def show_report_and_wait(page):
         "text=Show Report"
     ], timeout=8000)
 
-    # Wait for at least one data row (tbody tr) to be visible
-    try:
-        await page.wait_for_selector("table tbody tr", state="visible", timeout=30000)
-        first_row = page.locator("table tbody tr").first
-        await first_row.wait_for(timeout=5000)
-        txt = (await first_row.inner_text()).strip()
-        if len(txt) < 5:
-            await page.wait_for_timeout(1500)
-    except Exception:
+    # Wait for at least one data row with non-empty cells
+    ok = await _wait_for_data_rows(page, timeout_ms=30000)
+    if not ok:
         # Accept explicit "No record" message if present; else fail
         try:
             await page.get_by_text("No record", exact=False).wait_for(timeout=3000)
+            return  # no data case, but not an error
         except Exception:
-            raise RuntimeError("Report table did not populate with rows.")
+            raise RuntimeError("Report table did not populate with data rows.")
 
-# ---------- NEW: click the red PDF icon directly under filters ----------
+# ---------- click the red PDF icon directly under filters ----------
 async def click_report_pdf_icon(page):
     """
     Click the red 'PDF' icon directly under the filters (your screenshot).
@@ -432,6 +461,53 @@ async def click_report_pdf_icon(page):
             await ico.click(timeout=6000, force=True)
             return True
     return False
+
+# ---------- NEW: robust PDF download wrapper with settle + size check ----------
+async def download_report_pdf_with_checks(page, save_path: Path, settle_ms: int = 5600, min_bytes: int = 7000):
+    """
+    Wait an extra settle, click the red PDF icon, and verify file size.
+    If the file looks too small (likely header-only), retry once.
+    """
+    # Safety: ensure DOM still has data before we proceed
+    if not await _has_data_rows(page):
+        log("[pdf] Warning: no data rows detected just before download; giving 1.5s grace.")
+        await asyncio.sleep(1.5)
+
+    # Your requested settle delay (5–6s) after grid is ready
+    if settle_ms > 0:
+        await asyncio.sleep(settle_ms / 1000)
+
+    async def do_pdf_click():
+        clicked = await click_report_pdf_icon(page)
+        if not clicked:
+            raise RuntimeError("Red PDF icon not found")
+
+    # attempt 1
+    ok_dl = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
+    if not ok_dl:
+        return False
+
+    try:
+        size = Path(save_path).stat().st_size
+        log(f"[pdf] size: {size} bytes")
+        if size < min_bytes:
+            log("[pdf] File looks too small; retrying once after 3s…")
+            await asyncio.sleep(3.0)
+            ok_dl2 = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
+            if not ok_dl2:
+                return False
+            size2 = Path(save_path).stat().st_size
+            log(f"[pdf] retry size: {size2} bytes")
+            if size2 < min_bytes:
+                log("[pdf] Still small after retry; likely headers-only.")
+                return False
+    except FileNotFoundError:
+        log("[pdf] Save failed; retrying once after 3s…")
+        await asyncio.sleep(3.0)
+        ok_dl3 = await click_and_wait_download(page, do_pdf_click, save_path, timeout_ms=35000)
+        if not ok_dl3:
+            return False
+    return True
 
 # ---------------- main flow ----------------
 async def site_login_and_download():
@@ -577,7 +653,7 @@ async def site_login_and_download():
                 f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
             )
 
-        # ---------- use the strict "show report" & red icon download ----------
+        # ---------- UPDATED: strict "show report" & robust download ----------
         async def set_status_and_download(p, status_text: str, save_path: Path):
             ok4 = await select_status(p, status_text)
             log(f"[A] Status set to '{status_text}' (ok={ok4})")
@@ -587,17 +663,17 @@ async def site_login_and_download():
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
             log(f"[A] Report grid is visible ({status_text}).")
 
-            log("[A] Looking for PDF control (red icon under filters)…")
-            async def do_pdf_click():
-                # try the red icon directly
-                clicked = await click_report_pdf_icon(p)
-                if not clicked:
-                    raise RuntimeError("Red PDF icon not found")
-
-            ok_dl = await click_and_wait_download(p, do_pdf_click, save_path, timeout_ms=25000)
+            # robust download with your settle delay + size check
+            log("[A] Downloading PDF via red icon with settle + verification…")
+            ok_dl = await download_report_pdf_with_checks(
+                p,
+                save_path=save_path,
+                settle_ms=5600,     # ← your requested 5–6 seconds
+                min_bytes=7000      # adjust if your real PDFs are bigger/smaller
+            )
             if not ok_dl:
                 await snap(p, f"fail_pdf_click_{status_text.lower()}.png")
-                raise RuntimeError(f"[A] Could not obtain PDF ({status_text})")
+                raise RuntimeError(f"[A] Could not obtain a valid PDF ({status_text})")
             log(f"[A] PDF saved → {save_path}")
 
         # === Flow ===
