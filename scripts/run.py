@@ -17,12 +17,16 @@ def today_str():
     ist = timezone(timedelta(hours=5, minutes=30))
     return datetime.now(ist).strftime("%d-%m-%Y")
 
-def log(msg): print(msg, flush=True)
+def log(msg): 
+    print(msg, flush=True)
 
 async def snap(page, name, full=False):
-    if not DEBUG: return
-    try: await page.screenshot(path=str(OUT / name), full_page=bool(full))
-    except Exception: pass
+    if not DEBUG: 
+        return
+    try:
+        await page.screenshot(path=str(OUT / name), full_page=bool(full))
+    except Exception:
+        pass
 
 # ===================== FAST PANEL BINDING =====================
 
@@ -47,10 +51,9 @@ FAST_SELECT_JS = """
   const forId = label.getAttribute('for');
   if (forId) sel = root.querySelector('#'+CSS.escape(forId));
   if (!sel) {
-    // next select or nearest in same group
-    sel = label.nextElementSibling && label.nextElementSibling.tagName==='SELECT'
+    sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
       ? label.nextElementSibling
-      : (root.querySelector('select') || null);
+      : (label.closest('div') || root).querySelector('select');
   }
   if (!sel) return {ok:false, reason:'select not found'};
 
@@ -67,8 +70,7 @@ FAST_SELECT_JS = """
   sel.dispatchEvent(new Event('input',{bubbles:true}));
   sel.dispatchEvent(new Event('change',{bubbles:true}));
   try {
-    const evt = new Event('changed.bs.select',{bubbles:true});
-    sel.dispatchEvent(evt);
+    sel.dispatchEvent(new Event('changed.bs.select',{bubbles:true}));
   } catch(e) {}
   return {ok:true, value: sel.options[idx].textContent.trim()};
 }
@@ -84,9 +86,9 @@ FAST_MULTISELECT_ALL_JS = """
   const forId = label.getAttribute('for');
   if (forId) sel = root.querySelector('#'+CSS.escape(forId));
   if (!sel) {
-    sel = label.nextElementSibling && label.nextElementSibling.tagName==='SELECT'
+    sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
       ? label.nextElementSibling
-      : (label.closest('div')||root).querySelector('select');
+      : (label.closest('div') || root).querySelector('select');
   }
   if (!sel) return {ok:false, reason:'select not found'};
   let changed=false;
@@ -114,8 +116,10 @@ async def panel_input_value(panel, selectors) -> str:
             loc = panel.locator(sel).first
             if await loc.count():
                 v = (await loc.input_value()).strip()
-                if v: return v
-        except Exception: pass
+                if v: 
+                    return v
+        except Exception:
+            pass
     return ""
 
 # ===================== DATA READINESS (PANEL-SCOPED, QUICK) =====================
@@ -150,6 +154,7 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
         try:
             loc = panel.locator(sel).first
             if await loc.count():
+                await loc.scroll_into_view_if_needed()
                 await loc.click(timeout=5000)
                 clicked = True
                 break
@@ -168,7 +173,7 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     if not clicked:
         raise RuntimeError("Show Report button not found in panel")
 
-    // best-effort: wait for a report-ish response (but don’t stall too long)
+    # best-effort: wait for a report-ish response (but don't stall too long)
     try:
         await panel.page.wait_for_response(
             lambda r: any(k in (r.url or '').lower() for k in (
@@ -182,7 +187,7 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     # Your requested settle
     await asyncio.sleep(settle_ms/1000)
 
-    # Quick check for rows (don’t over-wait)
+    # Quick check for rows (don't over-wait)
     return await panel_has_rows(panel)
 
 # ===================== PDF (PANEL) =====================
@@ -231,14 +236,17 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
 
 async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min_bytes=7000):
     # honor settle then click pdf
-    if settle_ms>0: await asyncio.sleep(settle_ms/1000)
+    if settle_ms > 0:
+        await asyncio.sleep(settle_ms/1000)
 
     async def do_click():
         ok = await click_pdf_icon(panel)
-        if not ok: raise RuntimeError("PDF icon not found in panel")
+        if not ok: 
+            raise RuntimeError("PDF icon not found in panel")
 
     ok = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
-    if not ok: return False
+    if not ok: 
+        return False
 
     try:
         size = Path(save_path).stat().st_size
@@ -247,10 +255,12 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min
             # one quick retry
             await asyncio.sleep(2.0)
             ok2 = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
-            if not ok2: return False
+            if not ok2: 
+                return False
             size2 = Path(save_path).stat().st_size
             log(f"[pdf] retry size: {size2} bytes")
-            if size2 < min_bytes: return False
+            if size2 < min_bytes: 
+                return False
     except FileNotFoundError:
         return False
     return True
@@ -293,15 +303,25 @@ async def site_login_and_download():
 
         # Login
         log(f"Opening login page: {login_url}")
-        await page.goto(login_url, wait_until="domcontentloaded")
+        last_err = None
+        for _ in range(2):
+            try:
+                await page.goto(login_url, wait_until="domcontentloaded"); break
+            except PWTimeout as e: 
+                last_err = e
+        if last_err:
+            raise last_err
+
         if user_type:
             for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
                 if await page.locator(sel).count():
                     try:
                         await page.select_option(sel, value=user_type); break
                     except Exception:
-                        try: await page.select_option(sel, label=user_type); break
-                        except Exception: pass
+                        try:
+                            await page.select_option(sel, label=user_type); break
+                        except Exception:
+                            pass
 
         # Fill creds
         for sel in ["#username","input[name='username']","input[placeholder*='Login']","input[placeholder*='Email']"]:
@@ -310,12 +330,18 @@ async def site_login_and_download():
         for sel in ["#password","input[name='password']","input[name='pwd']"]:
             if await page.locator(sel).count():
                 await page.fill(sel, password); break
+
         await page.locator("button:has-text('Login'), button[type='submit'], [role='button']:has-text('Login')").first.click(timeout=5000)
         await page.wait_for_load_state("domcontentloaded")
+        log("Login step complete.")
+        log(f"Current URL: {page.url}")
 
-        # Navigate to Application Wise Report
-        # (loose selectors here are fine; we scope strictly after the page opens)
-        await page.get_by_text("MIS Reports", exact=False).first.click(timeout=7000)
+        # Navigate to Application Wise Report (coarse selectors, then panel-scope)
+        try:
+            await page.get_by_text("MIS Reports", exact=False).first.click(timeout=7000)
+        except Exception:
+            # fallback click_first style
+            await page.locator("a:has-text('MIS Reports'), button:has-text('MIS Reports'), li:has-text('MIS Reports')").first.click(timeout=7000)
         await asyncio.sleep(0.1)
         await page.get_by_text("Application Wise Report", exact=False).first.click(timeout=10000)
         await page.wait_for_load_state("domcontentloaded")
