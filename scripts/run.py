@@ -15,14 +15,14 @@ DEBUG = os.getenv("DEBUG", "0") == "1"
 
 # === Date helpers ===
 IST = timezone(timedelta(hours=5, minutes=30))
-def today_ist():
+def now_ist():
     return datetime.now(IST)
 
-def today_str_for_filename():
-    return today_ist().strftime("%d-%m-%Y")  # for file name only
+def today_for_filename():
+    return now_ist().strftime("%d-%m-%Y")  # for file name only
 
-def ist_today_formats():
-    d = today_ist()
+def ist_today_variants():
+    d = now_ist()
     return (
         d.strftime("%Y-%m-%d"),  # 2025-11-06
         d.strftime("%d-%m-%Y"),  # 06-11-2025
@@ -30,7 +30,7 @@ def ist_today_formats():
     )
 
 FROM_FIXED_DATE_VARIANTS = (
-    "2024-07-26",  # matches your manual "Period: 2024-07-26"
+    "2024-07-26",
     "26-07-2024",
     "26/07/2024",
 )
@@ -61,12 +61,10 @@ FAST_SELECT_JS = """
   const norm = s => (s||'').trim().toLowerCase();
   const wantedNorm = norm(wanted);
 
-  // find label inside this panel
   let label = Array.from(root.querySelectorAll('label'))
       .find(l => norm(l.textContent).includes(norm(labelText)));
   if (!label) return {ok:false, reason:'label not found'};
 
-  // find associated select inside the same area
   let sel = null;
   const forId = label.getAttribute('for');
   if (forId) sel = root.querySelector('#'+CSS.escape(forId));
@@ -77,7 +75,6 @@ FAST_SELECT_JS = """
   }
   if (!sel) return {ok:false, reason:'select not found'};
 
-  // choose option by text (includes)
   let idx = -1;
   for (let i=0;i<sel.options.length;i++){
     const t = norm(sel.options[i].textContent);
@@ -230,8 +227,10 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
 # ===================== PDF (PANEL) =====================
 
 async def click_pdf_icon(panel):
+    # Be strict: prefer a PDF icon *after* filters; otherwise first visible within panel
     for sel in [
-        "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
+        "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')][ancestor::div[.//button[contains(.,'Show Report')]]]",
+        "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
         "xpath=(.//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
     ]:
         ico = panel.locator(sel).first
@@ -251,7 +250,7 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
         log(f"[pdf] saved → {save_as_path}")
         return True
     except Exception as e:
-        log(f"[pdf] direct download failed ({e}); popup fallback…")
+        log(f"[pdf] direct download failed ({e}); popup fallback…}")
         try:
             async with page.expect_popup(timeout=5000) as pop_info:
                 await click_pdf()
@@ -289,7 +288,7 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min
         log(f"[pdf] size: {size} bytes")
         if size < min_bytes:
             await asyncio.sleep(2.0)
-            ok2 = await click_and_wait_download(panel.page, do_click, save_as_path=save_path, timeout_ms=35000)
+            ok2 = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
             if not ok2:
                 return False
             size2 = Path(save_path).stat().st_size
@@ -300,31 +299,60 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min
         return False
     return True
 
+# ===================== LOCAL PRINT FALLBACK (panel → PDF) =====================
+
+PRINT_INJECT_CSS = """
+<style id="__print_only">
+  @media print {
+    body * { visibility: hidden !important; }
+    #__print_target, #__print_target * { visibility: visible !important; }
+    #__print_target { position: absolute; left: 0; top: 0; width: 100% !important; }
+  }
+</style>
+"""
+
+async def render_panel_to_pdf(panel, pdf_path: Path):
+    page = panel.page
+    # Wrap the panel in a special container and inject @media print CSS
+    await page.evaluate(
+        """(root, css) => {
+            if (!document.getElementById('__print_only')) {
+              document.head.insertAdjacentHTML('beforeend', css);
+            }
+            const wrapId = '__print_target';
+            if (!document.getElementById(wrapId)) {
+              const wrapper = document.createElement('div');
+              wrapper.id = wrapId;
+              const p = root;
+              p.parentNode.insertBefore(wrapper, p);
+              wrapper.appendChild(p);
+            }
+        }""",
+        panel, PRINT_INJECT_CSS
+    )
+    # Ensure print media
+    await page.emulate_media(media="print")
+    # Generate PDF of the whole page but only our panel is visible
+    # Note: Chromium-only; margins small to fit content
+    await page.pdf(path=str(pdf_path), format="A4", margin={"top":"8mm","right":"8mm","bottom":"8mm","left":"8mm"}, print_background=True)
+    log(f"[pdf:fallback] printed panel to → {pdf_path}")
+
 # ===================== DATES: TRY MULTIPLE FORMATS THEN SHOW REPORT =====================
 
 async def set_dates_and_show(panel, *, settle_ms_first=5600):
-    """
-    Try (from,to) in multiple formats:
-    - from: 2024-07-26 / 26-07-2024 / 26/07/2024
-    - to:   IST today in YYYY-MM-DD / DD-MM-YYYY / DD/MM/YYYY
-    After each attempt, click Show Report and check for rows.
-    Returns True if rows found.
-    """
-    to_variants = ist_today_formats()
+    to_variants = ist_today_variants()
     tries = []
     for f in FROM_FIXED_DATE_VARIANTS:
         for t in to_variants:
             tries.append((f, t))
 
     for idx, (from_val, to_val) in enumerate(tries, start=1):
-        # Fill both dates inside panel
         try:
             res = await panel.evaluate(DATE_FILL_JS, {"fromVal": from_val, "toVal": to_val})
             log(f"[dates] try {idx}: From='{from_val}' To='{to_val}' set={res}")
         except Exception as e:
             log(f"[dates] set error on try {idx}: {e}")
 
-        # Show Report and wait
         has_rows = await show_report_and_wait(panel, settle_ms=settle_ms_first if idx == 1 else 3000, response_wait_ms=8000)
         if has_rows:
             log(f"[dates] data present with format try {idx}")
@@ -341,7 +369,7 @@ async def site_login_and_download():
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
     user_type   = os.getenv("USER_TYPE", "").strip()
-    stamp       = today_str_for_filename()
+    stamp       = today_for_filename()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -424,16 +452,23 @@ async def site_login_and_download():
             await fast_select_all(panel, "Nature Of Application")
             await fast_select(panel, "Status", status_text)
 
-            # Set explicit date range (26/07/2024 → today) with multi-format fallback
+            # Explicit date range (26/07/2024 → today) with multi-format fallback
             ok_rows = await set_dates_and_show(panel, settle_ms_first=5600)
             if not ok_rows:
                 raise RuntimeError(f"No data rows in panel after trying date formats ({status_text}).")
 
             await snap(page, f"after_grid_shown_{status_text.lower()}.png")
+
+            # 1) Try server export
             save_path = OUT / f"{filename} {stamp}.pdf"
             ok = await download_pdf_from_panel(panel, save_path, settle_ms=5600, min_bytes=7000)
+
+            # 2) Fallback: locally print the on-screen panel to PDF if server export is blank
             if not ok:
-                raise RuntimeError(f"Export produced a tiny PDF for {status_text}.")
+                log("[pdf:fallback] server export looked empty — printing panel to PDF.")
+                save_path = OUT / f"{filename} {stamp}.pdf"  # same name
+                await render_panel_to_pdf(panel, save_path)
+
             log(f"Saved {save_path.name}")
             return str(save_path)
 
@@ -474,4 +509,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except Exception as e:
         traceback.print_exc(); sys.exit(1)
-
