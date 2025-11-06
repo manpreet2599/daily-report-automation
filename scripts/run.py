@@ -12,8 +12,9 @@ OUT = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
 def today_str():
+    # dd-mm-yyyy
     ist = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist).strftime("%Y-%m-%d")
+    return datetime.now(ist).strftime("%d-%m-%Y")
 
 def log(msg): print(msg, flush=True)
 
@@ -319,6 +320,7 @@ async def select_nature_all(p):
         await p.screenshot(path=str(OUT / "fail_nature.png"), full_page=True)
         return False
 
+# Status with extra robustness: try exact, then case-insensitive contains (JS)
 async def select_status(p, option_text: str):
     log(f"[filter] Status → {option_text}")
     ok, sel = await _native_select(
@@ -331,6 +333,37 @@ async def select_status(p, option_text: str):
         await p.screenshot(path=str(OUT / "after_select_status.png"), full_page=True)
         (OUT / "selected_status.txt").write_text(f"via native: {sel}", encoding="utf-8")
         return True
+
+    # case-insensitive contains on label "Status"
+    js = """
+    (wanted) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(document.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes('status'));
+      if (!L) return false;
+      const root = L.closest('div') || L.parentElement || document.body;
+      const sel = root.querySelector('select');
+      if (!sel) return false;
+      const w = norm(wanted);
+      let idx = -1;
+      for (let i=0;i<sel.options.length;i++){
+        const txt = norm(sel.options[i].textContent);
+        if (txt.includes(w)) { idx = i; break; }
+      }
+      if (idx === -1) return false;
+      sel.selectedIndex = idx;
+      sel.dispatchEvent(new Event('input', {bubbles:true}));
+      sel.dispatchEvent(new Event('change', {bubbles:true}));
+      return true;
+    }
+    """
+    try:
+        ok2 = await p.evaluate(js, option_text)
+        await p.screenshot(path=str(OUT / "after_select_status.png"), full_page=True)
+        return bool(ok2)
+    except Exception:
+        pass
+
     ok = await _bootstrap_select(p, "Status", option_text)
     await _dump_near(p, "Status", "status")
     await p.screenshot(path=str(OUT / "after_select_status.png"), full_page=True)
@@ -352,8 +385,9 @@ async def site_login_and_download():
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
-    nameA       = os.getenv("REPORT_A_NAME", "ReportA")
-    nameB       = os.getenv("REPORT_B_NAME", "ReportB")
+    # Default the names to what you want
+    nameA       = os.getenv("REPORT_A_NAME", "Delayed Apps")
+    nameB       = os.getenv("REPORT_B_NAME", "Pending Apps")
     user_type   = os.getenv("USER_TYPE", "").strip()
     stamp       = today_str()
 
@@ -389,7 +423,7 @@ async def site_login_and_download():
                 await route.continue_()
         await context.route("**/*", speed_filter)
 
-        # patient but not too long timeouts
+        # timeouts
         context.set_default_timeout(45000)               # actions: 45s
         context.set_default_navigation_timeout(120000)   # nav: 2 min
 
@@ -440,7 +474,7 @@ async def site_login_and_download():
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
-        async def steps_A(p, save_path):
+        async def open_application_wise(p):
             log("[A] Opening 'MIS Reports'…")
             if not await click_first(p, [
                 "nav >> text=MIS Reports","text=MIS Reports","a:has-text('MIS Reports')",
@@ -477,38 +511,27 @@ async def site_login_and_download():
             await p.wait_for_load_state("networkidle")
             await p.screenshot(path=str(OUT / "after_open_app_wise.png"), full_page=True)
 
-            # --- Filters (fast + robust) ---
+        async def apply_common_filters(p):
+            # Circle / Division / Nature(all) — left as-is
             log("[A] Selecting filters…")
             ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
             await p.wait_for_timeout(250)
-            circle_seen = await read_display_value_near_label(p, "Circle Office")
-            (OUT / "seen_circle.txt").write_text(circle_seen or "", encoding="utf-8")
-
             ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
             await p.wait_for_timeout(200)
-            division_seen = await read_display_value_near_label(p, "Division Office")
-            (OUT / "seen_division.txt").write_text(division_seen or "", encoding="utf-8")
-
             ok3 = await select_nature_all(p)
             await p.wait_for_timeout(150)
-            nature_seen = await read_display_value_near_label(p, "Nature Of Application")
-            (OUT / "seen_nature.txt").write_text(nature_seen or "", encoding="utf-8")
+            (OUT / "dropdown_warning.txt").write_text(
+                f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
+            )
 
-            ok4 = await select_status(p, "DELAYED")
+        async def set_status_and_download(p, status_text: str, save_path: Path):
+            # Set Status (Delayed / Pending), Show Report, wait grid, download PDF
+            ok4 = await select_status(p, status_text)
             await p.wait_for_timeout(150)
             status_seen = await read_display_value_near_label(p, "Status")
-            (OUT / "seen_status.txt").write_text(status_seen or "", encoding="utf-8")
+            (OUT / f"seen_status_{status_text.lower()}.txt").write_text(status_seen or "", encoding="utf-8")
+            log(f"[A] Status set to '{status_text}' (ok={ok4}, seen='{status_seen}')")
 
-            warning_text = (f"Circle:{ok1} Division:{ok2} NatureAll:{ok3} Status:{ok4}\n"
-                            f"Seen -> Circle:'{circle_seen}' Division:'{division_seen}' Nature:'{nature_seen}' Status:'{status_seen}'\n"
-                            "Proceeding to Show Report.")
-            (OUT / "dropdown_warning.txt").write_text(warning_text, encoding="utf-8")
-            log(f"[A] WARNING: {warning_text}")
-
-            await p.screenshot(path=str(OUT / "after_select_filters.png"), full_page=True)
-            log("[A] Filters selected.")
-
-            # Show Report
             log("[A] Clicking 'Show Report'…")
             try:
                 btn = p.locator("button:has-text('Show Report'), input[type='button'][value='Show Report']").first
@@ -516,7 +539,6 @@ async def site_login_and_download():
                 await btn.wait_for({"state": "visible"})
             except Exception:
                 pass
-
             if not await click_first(p, [
                 "button:has-text('Show Report')",
                 "input[type='button'][value='Show Report']",
@@ -528,14 +550,14 @@ async def site_login_and_download():
             log("[A] Waiting for report grid (up to 45s)…")
             grid_ok = await wait_for_report_table(p, timeout_ms=45000)
             if not grid_ok:
-                (OUT / "report_timeout.txt").write_text("Report grid did not appear in 45s.", encoding="utf-8")
-                await p.screenshot(path=str(OUT / "fail_no_grid.png"), full_page=True)
+                (OUT / "report_timeout.txt").write_text(f"Report grid did not appear for {status_text} in 45s.", encoding="utf-8")
+                await p.screenshot(path=str(OUT / f"fail_no_grid_{status_text.lower()}.png"), full_page=True)
                 try:
-                    (OUT / "snippet_after_show.html").write_text(await p.content(), encoding="utf-8")
+                    (OUT / f"snippet_after_show_{status_text.lower()}.html").write_text(await p.content(), encoding="utf-8")
                 except Exception: pass
-                raise RuntimeError("[A] Report grid did not appear")
-            await p.screenshot(path=str(OUT / "after_grid_shown.png"), full_page=True)
-            log("[A] Report grid is visible.")
+                raise RuntimeError(f"[A] Report grid did not appear ({status_text})")
+            await p.screenshot(path=str(OUT / f"after_grid_shown_{status_text.lower()}.png"), full_page=True)
+            log(f"[A] Report grid is visible ({status_text}).")
 
             # PDF
             log("[A] Looking for PDF control…")
@@ -547,8 +569,8 @@ async def site_login_and_download():
             ]
             found_any = any([await p.locator(sel).count() for sel in pdf_targets])
             if not found_any:
-                await p.screenshot(path=str(OUT / "fail_find_pdf.png"), full_page=True)
-                raise RuntimeError("[A] No PDF control found on the page")
+                await p.screenshot(path=str(OUT / f"fail_find_pdf_{status_text.lower()}.png"), full_page=True)
+                raise RuntimeError(f"[A] No PDF control found on the page ({status_text})")
 
             async def do_pdf_click():
                 try: await p.evaluate("window.scrollTo(0,0)")
@@ -569,20 +591,33 @@ async def site_login_and_download():
 
             ok_dl = await click_and_wait_download(p, do_pdf_click, save_path, timeout_ms=35000)
             if not ok_dl:
-                await p.screenshot(path=str(OUT / "fail_pdf_click.png"), full_page=True)
+                await p.screenshot(path=str(OUT / f"fail_pdf_click_{status_text.lower()}.png"), full_page=True)
                 try:
                     html = await p.evaluate("""() => {
                         const tb = document.querySelector('.dt-buttons') || document.body;
                         return tb.outerHTML.slice(0, 8000);
                     }""")
-                    (OUT / "snippet_toolbar_html.html").write_text(html, encoding="utf-8")
+                    (OUT / f"snippet_toolbar_html_{status_text.lower()}.html").write_text(html, encoding="utf-8")
                 except Exception: pass
-                raise RuntimeError("[A] Could not obtain PDF")
+                raise RuntimeError(f"[A] Could not obtain PDF ({status_text})")
             log(f"[A] PDF saved → {save_path}")
 
-        # Run A and B (reuse A for now)
-        pathA = OUT / f"{nameA}_{stamp}.pdf"; await steps_A(page, pathA); log(f"Saved {pathA.name}")
-        pathB = OUT / f"{nameB}_{stamp}.pdf"; await steps_A(page, pathB); log(f"Saved {pathB.name}")
+        # === Flow ===
+        # 1) Open the report page once
+        await open_application_wise(page)
+
+        # 2) Apply the shared filters once (Circle/Division/Nature)
+        await apply_common_filters(page)
+
+        # 3) Report A: Status = DELAYED → download
+        pathA = OUT / f"{os.getenv('REPORT_A_NAME','Delayed Apps')} {stamp}.pdf"
+        await set_status_and_download(page, "DELAYED", pathA)
+        log(f"Saved {pathA.name}")
+
+        # 4) Report B: toggle only Status to PENDING → download
+        pathB = OUT / f"{os.getenv('REPORT_B_NAME','Pending Apps')} {stamp}.pdf"
+        await set_status_and_download(page, "PENDING", pathB)
+        log(f"Saved {pathB.name}")
 
         await context.close(); await browser.close()
     return [str(pathA), str(pathB)]
