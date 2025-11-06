@@ -262,9 +262,7 @@ async def select_division(p, option_text: str):
                 break
 
     # Many sites fetch division list via AJAX; wait for that response OR options to increase.
-    # We race: fast response OR options count growth (whichever comes first).
     if native_sel:
-        # start two awaits in parallel
         wait_resp = wait_for_any_response(
             p,
             substrings=["division", "getDivision", "bycircle", "divisionList", "getdivisions"],
@@ -273,7 +271,6 @@ async def select_division(p, option_text: str):
         wait_opts = wait_options_increase(p, native_sel, min_count=2, timeout_ms=7000)
         await asyncio.gather(wait_resp, wait_opts)
 
-        # once populated, pick our option quickly
         for _ in range(50):  # up to ~5s, 100ms steps
             try:
                 if await p.locator(f"{native_sel} >> option", has_text=option_text).count():
@@ -287,7 +284,7 @@ async def select_division(p, option_text: str):
                 pass
             await asyncio.sleep(0.1)
 
-    # Bootstrap-select fallback (fast)
+    # Bootstrap-select fallback
     ok = await _bootstrap_select(p, "Division Office", option_text)
     await _dump_near(p, "Division Office", "division")
     await snap(p, "after_select_division.png")
@@ -389,6 +386,52 @@ async def wait_for_report_table(p, timeout_ms=30000):
             return True
         except Exception:
             return False
+
+# ---------- NEW: after Show Report, ensure rows (not just header) ----------
+async def show_report_and_wait(page):
+    # Click the green Show Report
+    await click_first(page, [
+        "button:has-text('Show Report')",
+        "input[type='button'][value='Show Report']",
+        "text=Show Report"
+    ], timeout=8000)
+
+    # Wait for at least one data row (tbody tr) to be visible
+    try:
+        await page.wait_for_selector("table tbody tr", state="visible", timeout=30000)
+        first_row = page.locator("table tbody tr").first
+        await first_row.wait_for(timeout=5000)
+        txt = (await first_row.inner_text()).strip()
+        if len(txt) < 5:
+            await page.wait_for_timeout(1500)
+    except Exception:
+        # Accept explicit "No record" message if present; else fail
+        try:
+            await page.get_by_text("No record", exact=False).wait_for(timeout=3000)
+        except Exception:
+            raise RuntimeError("Report table did not populate with rows.")
+
+# ---------- NEW: click the red PDF icon directly under filters ----------
+async def click_report_pdf_icon(page):
+    """
+    Click the red 'PDF' icon directly under the filters (your screenshot).
+    Avoids generic DataTables export button which yielded blank PDFs.
+    """
+    candidates = [
+        # PDF icon inside the Application Wise Report panel
+        "xpath=//div[contains(.,'Application Wise Report')]//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
+        # Any topmost PDF icon on the page as fallback
+        "xpath=(//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
+        # Link wrapping the image
+        "xpath=(//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
+    ]
+    for sel in candidates:
+        if await page.locator(sel).count():
+            ico = page.locator(sel).first
+            await ico.scroll_into_view_if_needed()
+            await ico.click(timeout=6000, force=True)
+            return True
+    return False
 
 # ---------------- main flow ----------------
 async def site_login_and_download():
@@ -534,70 +577,22 @@ async def site_login_and_download():
                 f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
             )
 
+        # ---------- use the strict "show report" & red icon download ----------
         async def set_status_and_download(p, status_text: str, save_path: Path):
-            # Set Status quickly
             ok4 = await select_status(p, status_text)
             log(f"[A] Status set to '{status_text}' (ok={ok4})")
 
-            # Click Show Report and wait for either a matching response or the table
             log("[A] Clicking 'Show Report'…")
-            async def _click_show():
-                await click_first(p, [
-                    "button:has-text('Show Report')",
-                    "input[type='button'][value='Show Report']",
-                    "text=Show Report"
-                ], timeout=8000)
-
-            # Race: report response OR table/grid visible
-            resp_wait = wait_for_any_response(
-                p,
-                substrings=["report", "applicationwisereport", "getReport", "search", "datatable"],
-                timeout_ms=12000
-            )
-            click_task = asyncio.create_task(_click_show())
-            done, pending = await asyncio.wait({click_task}, timeout=12, return_when=asyncio.ALL_COMPLETED)
-            # after click, wait DOM change (fast)
-            grid_ok = await wait_for_report_table(p, timeout_ms=20000)
-            if not grid_ok:
-                # give response waiter one more try
-                await resp_wait
-                grid_ok = await wait_for_report_table(p, timeout_ms=10000)
-            if not grid_ok:
-                (OUT / "report_timeout.txt").write_text(f"Report grid did not appear for {status_text}.", encoding="utf-8")
-                await snap(p, f"fail_no_grid_{status_text.lower()}.png")
-                raise RuntimeError(f"[A] Report grid did not appear ({status_text})")
+            await show_report_and_wait(p)
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
             log(f"[A] Report grid is visible ({status_text}).")
 
-            # PDF
-            log("[A] Looking for PDF control…")
-            pdf_targets = [
-                "a[title*='PDF']","button[title*='PDF']","button.buttons-pdf",
-                "div.dt-buttons >> button:has-text('PDF')",
-                "button:has-text('Export PDF')","button:has-text('Download PDF')",
-                "i.fa-file-pdf","img[alt*='PDF']",
-            ]
-            found_any = any([await p.locator(sel).count() for sel in pdf_targets])
-            if not found_any:
-                await snap(p, f"fail_find_pdf_{status_text.lower()}.png")
-                raise RuntimeError(f"[A] No PDF control found on the page ({status_text})")
-
+            log("[A] Looking for PDF control (red icon under filters)…")
             async def do_pdf_click():
-                try: await p.evaluate("window.scrollTo(0,0)")
-                except Exception: pass
-                for sel in pdf_targets:
-                    try:
-                        if await p.locator(sel).count():
-                            el = p.locator(sel).first
-                            await el.scroll_into_view_if_needed()
-                            await el.click(timeout=6000); return
-                    except Exception: continue
-                try:
-                    el = p.locator("div.dt-buttons button").first
-                    await el.scroll_into_view_if_needed()
-                    await el.click(timeout=6000)
-                except Exception:
-                    pass
+                # try the red icon directly
+                clicked = await click_report_pdf_icon(p)
+                if not clicked:
+                    raise RuntimeError("Red PDF icon not found")
 
             ok_dl = await click_and_wait_download(p, do_pdf_click, save_path, timeout_ms=25000)
             if not ok_dl:
