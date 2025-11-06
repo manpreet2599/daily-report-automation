@@ -250,7 +250,7 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
         log(f"[pdf] saved → {save_as_path}")
         return True
     except Exception as e:
-        log(f"[pdf] direct download failed ({e}); popup fallback…}")
+        log(f"[pdf] direct download failed ({e}); popup fallback…")
         try:
             async with page.expect_popup(timeout=5000) as pop_info:
                 await click_pdf()
