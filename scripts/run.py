@@ -45,7 +45,6 @@ async def snap(page, name, full=False):
 # ===================== PANEL FINDER =====================
 
 async def get_app_panel(page):
-    # Panel that contains "Application Wise Report" (case-insensitive)
     panel = page.locator(
         "xpath=//div[.//text()[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
         "'application wise report')]]"
@@ -71,6 +70,21 @@ async def _bs_find_toggle_in_root(root, label_text: str):
     )
     return root.locator(f"xpath={xp}").first
 
+async def _bs_find_toggle_by_text_any(root, needle_regex: str):
+    # find ANY bootstrap-select whose button text matches regex (case-insensitive)
+    btns = root.locator(".bootstrap-select .dropdown-toggle")
+    count = await btns.count()
+    rx = re.compile(needle_regex, re.I)
+    for i in range(count):
+        b = btns.nth(i)
+        try:
+            txt = (await b.inner_text() or "").strip()
+        except Exception:
+            txt = ""
+        if rx.search(txt):
+            return b
+    return root.locator("__never__")  # empty
+
 async def _bs_wait_button_text_in_root(root, label_text: str, expect_text: str, timeout_ms=6000):
     btn = await _bs_find_toggle_in_root(root, label_text)
     try:
@@ -85,7 +99,7 @@ async def _bs_wait_button_text_in_root(root, label_text: str, expect_text: str, 
     except Exception:
         return False
 
-async def _bs_close_dropdown(page):
+async def _close_dropdown_like_human(page):
     try: await page.keyboard.press("Escape")
     except Exception: pass
     try: await page.mouse.click(1, 1)
@@ -100,12 +114,11 @@ async def bs_select_option_in_root(root, label_text: str, option_text: str) -> b
     await btn.scroll_into_view_if_needed()
     await btn.click(timeout=6000)
 
-    # visible menu (often appended to body)
     menu = root.page.locator(".dropdown-menu.show, .show .dropdown-menu").first
     try:
         await menu.wait_for(timeout=5000)
     except Exception:
-        await _bs_close_dropdown(root.page)
+        await _close_dropdown_like_human(root.page)
         return False
 
     item = menu.locator("li, a, span, .text").filter(has_text=option_text).first
@@ -118,12 +131,12 @@ async def bs_select_option_in_root(root, label_text: str, option_text: str) -> b
                 item = cand; break
 
     if not await item.count():
-        await _bs_close_dropdown(root.page)
+        await _close_dropdown_like_human(root.page)
         return False
 
     await item.scroll_into_view_if_needed()
     await item.click(timeout=6000, force=True)
-    await _bs_close_dropdown(root.page)
+    await _close_dropdown_like_human(root.page)
 
     ok = await _bs_wait_button_text_in_root(root, label_text, option_text, timeout_ms=6000)
     return ok
@@ -172,27 +185,22 @@ async def native_select_option_in_root(root, label_text: str, option_text: str) 
         return False
 
 async def select_option_any(panel, page, label_text: str, option_text: str) -> bool:
-    # 1: panel bootstrap
     ok = await bs_select_option_in_root(panel, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (panel bootstrap)")
         return True
-    # 2: panel native
     ok = await native_select_option_in_root(panel, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (panel native)")
         return True
-    # 3: page bootstrap
     ok = await bs_select_option_in_root(page, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (page bootstrap)")
         return True
-    # 4: page native
     ok = await native_select_option_in_root(page, label_text, option_text)
     if ok:
         log(f"[filter] {label_text} → {option_text} (page native)")
         return True
-    # 5: any-select fallback (by option text only)
     try:
         found = await page.evaluate("""
           (wanted) => {
@@ -220,79 +228,82 @@ async def select_option_any(panel, page, label_text: str, option_text: str) -> b
             return True
     except Exception:
         pass
-
     log(f"[filter] {label_text} FAILED to set '{option_text}' (all methods).")
     return False
 
-# ====== multi-select helper for "Nature Of Application" ======
-async def bs_select_all_if_present(panel, page, label_text: str) -> bool:
+# ====== Nature Of Application (Select All) — robust ======
+async def select_nature_all(panel, page) -> bool:
     """
-    For multi-selects (e.g., Nature Of Application), click "Select All" if present.
-    Panel scope → page scope → native all.
+    Select ALL options for 'Nature Of Application' — works even if the label
+    is not <label>. Tries:
+      1) Find bootstrap-select by true label.
+      2) Find bootstrap-select whose button text contains 'nature' (case-insensitive).
+      3) Native multi-select: select every option.
+    Returns True on success, False otherwise.
     """
-    async def try_in_root(root) -> bool:
-        btn = await _bs_find_toggle_in_root(root, label_text)
+    # 1) true-label bootstrap
+    btn = await _bs_find_toggle_in_root(panel, "Nature Of Application")
+    if not await btn.count():
+        btn = await _bs_find_toggle_by_text_any(panel, r"\bnature\b")
+    if not await btn.count():
+        # try page-scope
+        btn = await _bs_find_toggle_in_root(page, "Nature Of Application")
         if not await btn.count():
-            return False
+            btn = await _bs_find_toggle_by_text_any(page, r"\bnature\b")
+
+    if await btn.count():
         await btn.scroll_into_view_if_needed()
         await btn.click(timeout=6000)
         menu = page.locator(".dropdown-menu.show, .show .dropdown-menu").first
         try:
             await menu.wait_for(timeout=4000)
         except Exception:
-            await _bs_close_dropdown(page)
-            return False
-
+            await _close_dropdown_like_human(page)
+            pass
+        # Prefer explicit "Select All"
         sel_all = menu.locator("li, a, span, .text").filter(has_text=re.compile(r"select\s*all", re.I)).first
-        if await sel_all.count():
-            await sel_all.click(timeout=5000, force=True)
-            await _bs_close_dropdown(page)
-            log(f"[filter] {label_text} → Select All (bootstrap)")
-            return True
-
-        # else click first few visible items (fallback)
         clicked = False
-        try:
+        if await sel_all.count():
+            try:
+                await sel_all.click(timeout=5000, force=True)
+                clicked = True
+            except Exception:
+                clicked = False
+        else:
+            # Fallback: click first 20 items
             vis = menu.locator("li:not(.disabled) a, li:not(.disabled) .text")
-            count = await vis.count()
-            for i in range(min(count, 20)):
-                it = vis.nth(i)
+            cnt = await vis.count()
+            for i in range(min(cnt, 20)):
                 try:
-                    await it.click(timeout=800)
+                    await vis.nth(i).click(timeout=600)
                     clicked = True
                 except Exception:
                     pass
+        await _close_dropdown_like_human(page)
+
+        # Verify button text no longer shows "None selected"
+        try:
+            inner = btn.locator(".filter-option-inner-inner").first
+            txt = (await inner.inner_text() if await inner.count() else await btn.inner_text()).strip().lower()
         except Exception:
-            pass
-        await _bs_close_dropdown(page)
-        if clicked:
-            log(f"[filter] {label_text} → selected multiple (bootstrap)")
-            return True
-        return False
+            txt = ""
+        ok = clicked and ("none selected" not in txt)
+        log(f"[filter] Nature Of Application → Select All (bootstrap heuristic ok={ok})")
+        return ok
 
-    # panel then page
-    if await try_in_root(panel): return True
-    if await try_in_root(page): return True
-
-    # native select-all
+    # 3) Native multi-select select-all
     try:
         ok = await panel.evaluate("""
-          (root, labelText) => {
+          (root) => {
             const norm = s => (s||'').trim().toLowerCase();
-            let label = Array.from(root.querySelectorAll('label'))
-              .find(l => norm(l.textContent).includes(norm(labelText)));
-            let sel = null;
-            if (label) {
-              const forId = label.getAttribute('for');
-              if (forId) sel = root.querySelector('#'+CSS.escape(forId));
-              if (!sel) {
-                sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
-                  ? label.nextElementSibling
-                  : (label.closest('div') || root).querySelector('select');
-              }
-            } else {
-              sel = root.querySelector('select');
+            // find a select that is near text containing 'nature'
+            const blocks = Array.from(root.querySelectorAll('div, section, form, fieldset'));
+            let target = null;
+            for (const b of blocks) {
+              const t = norm(b.textContent);
+              if (t.includes('nature') && b.querySelector('select')) { target = b; break; }
             }
+            const sel = target ? target.querySelector('select') : root.querySelector('select[multiple]');
             if (!sel) return false;
             let changed = false;
             for (const o of sel.options) { if (!o.selected) { o.selected = true; changed = true; } }
@@ -302,15 +313,14 @@ async def bs_select_all_if_present(panel, page, label_text: str) -> bool:
             }
             return true;
           }
-        """, label_text)
-        if ok:
-            log(f"[filter] {label_text} → Select All (native)")
-            return True
+        """)
+        log(f"[filter] Nature Of Application → Select All (native heuristic ok={ok})")
+        return bool(ok)
     except Exception:
         pass
     return False
 
-# ====== Wait for dependent Division after Circle ======
+# ====== Division wait after Circle ======
 async def wait_until_option_exists_any_select(page, option_text: str, timeout_ms: int = 20000) -> bool:
     deadline = time.time() + timeout_ms/1000
     while time.time() < deadline:
@@ -370,8 +380,6 @@ DATE_FILL_JS = """
 }
 """
 
-# ===================== DATA READINESS (PANEL) =====================
-
 async def panel_has_rows(panel):
     try:
         return await panel.evaluate("""
@@ -388,8 +396,6 @@ async def panel_has_rows(panel):
         """)
     except Exception:
         return False
-
-# ===================== SHOW REPORT =====================
 
 async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000):
     clicked = False
@@ -432,8 +438,6 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
     await asyncio.sleep(settle_ms/1000)
     return await panel_has_rows(panel)
 
-# ===================== PDF ICON =====================
-
 async def click_pdf_icon(panel):
     for sel in [
         "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')][ancestor::div[.//button[contains(.,'Show Report')]]]",
@@ -447,7 +451,7 @@ async def click_pdf_icon(panel):
             return True
     return False
 
-# ===================== REQUEST CAPTURE & REPLAY =====================
+# ===================== Request capture & replay =====================
 
 class RequestSniffer:
     def __init__(self, page):
@@ -688,7 +692,6 @@ async def site_login_and_download():
         )
         context = await browser.new_context(accept_downloads=True)
 
-        # Only block fonts; keep CSS/images so widgets behave
         async def speed_filter(route, request):
             if request.resource_type in ("font",):
                 await route.abort()
@@ -759,7 +762,6 @@ async def site_login_and_download():
             await wait_division_options_after_circle(page, target_division_text=target_div, max_wait_ms=25000)
 
             if not await select_option_any(panel, page, "Division Office", target_div):
-                # last-chance: directly pick the option where it exists
                 picked = await page.evaluate("""
                   (wanted) => {
                     const norm = s => (s||'').trim().toLowerCase();
@@ -784,8 +786,12 @@ async def site_login_and_download():
                     await snap(page, "fail_division.png")
                     raise RuntimeError("Could not set Division Office (all methods)")
 
-            # 3) Nature of Application → **Select All BEFORE Status**
-            await bs_select_all_if_present(panel, page, "Nature Of Application")
+            # 3) Nature of Application → **Select All BEFORE Status** (mandatory)
+            ok_nat = await select_nature_all(panel, page)
+            log(f"[filter] Nature Of Application → Select All result: {ok_nat}")
+            if not ok_nat:
+                await snap(page, "fail_nature.png")
+                raise RuntimeError("Could not select Nature Of Application (Select All)")
 
             # 4) Status (after Nature)
             if not await select_option_any(panel, page, "Status", status_text):
