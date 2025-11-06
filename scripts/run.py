@@ -224,7 +224,7 @@ async def select_option_any(panel, page, label_text: str, option_text: str) -> b
     log(f"[filter] {label_text} FAILED to set '{option_text}' (all methods).")
     return False
 
-# ====== NEW: multi-select helper for "Nature Of Application" ======
+# ====== multi-select helper for "Nature Of Application" ======
 async def bs_select_all_if_present(panel, page, label_text: str) -> bool:
     """
     For multi-selects (e.g., Nature Of Application), click "Select All" if present.
@@ -784,10 +784,10 @@ async def site_login_and_download():
                     await snap(page, "fail_division.png")
                     raise RuntimeError("Could not set Division Office (all methods)")
 
-            # 3) Nature of Application → select all if present
+            # 3) Nature of Application → **Select All BEFORE Status**
             await bs_select_all_if_present(panel, page, "Nature Of Application")
 
-            # 4) Status
+            # 4) Status (after Nature)
             if not await select_option_any(panel, page, "Status", status_text):
                 await snap(page, f"fail_status_{status_text}.png")
                 raise RuntimeError(f"Could not set Status='{status_text}' (all methods)")
