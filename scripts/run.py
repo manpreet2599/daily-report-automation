@@ -35,6 +35,9 @@ FROM_FIXED_DATE_VARIANTS = (
     "26/07/2024",
 )
 
+# Treat anything below this as a "blank/header-only" PDF (your manual good file ~54,696 bytes)
+MIN_VALID_PDF_BYTES = 50000
+
 def log(msg):
     print(msg, flush=True)
 
@@ -227,7 +230,7 @@ async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000)
 # ===================== PDF (PANEL) =====================
 
 async def click_pdf_icon(panel):
-    # Be strict: prefer a PDF icon *after* filters; otherwise first visible within panel
+    # Prefer an icon near the filters; fallback to first visible inside panel
     for sel in [
         "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')][ancestor::div[.//button[contains(.,'Show Report')]]]",
         "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
@@ -270,7 +273,8 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
             log(f"[pdf] popup fallback failed: {e2}")
         return False
 
-async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min_bytes=7000):
+async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600):
+    """Returns (ok, size_bytes_or_0)."""
     if settle_ms > 0:
         await asyncio.sleep(settle_ms/1000)
 
@@ -281,23 +285,14 @@ async def download_pdf_from_panel(panel, save_path: Path, *, settle_ms=5600, min
 
     ok = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
     if not ok:
-        return False
+        return False, 0
 
     try:
         size = Path(save_path).stat().st_size
         log(f"[pdf] size: {size} bytes")
-        if size < min_bytes:
-            await asyncio.sleep(2.0)
-            ok2 = await click_and_wait_download(panel.page, do_click, save_path, timeout_ms=35000)
-            if not ok2:
-                return False
-            size2 = Path(save_path).stat().st_size
-            log(f"[pdf] retry size: {size2} bytes")
-            if size2 < min_bytes:
-                return False
+        return True, size
     except FileNotFoundError:
-        return False
-    return True
+        return False, 0
 
 # ===================== LOCAL PRINT FALLBACK (panel → PDF) =====================
 
@@ -330,10 +325,7 @@ async def render_panel_to_pdf(panel, pdf_path: Path):
         }""",
         panel, PRINT_INJECT_CSS
     )
-    # Ensure print media
     await page.emulate_media(media="print")
-    # Generate PDF of the whole page but only our panel is visible
-    # Note: Chromium-only; margins small to fit content
     await page.pdf(path=str(pdf_path), format="A4", margin={"top":"8mm","right":"8mm","bottom":"8mm","left":"8mm"}, print_background=True)
     log(f"[pdf:fallback] printed panel to → {pdf_path}")
 
@@ -461,12 +453,14 @@ async def site_login_and_download():
 
             # 1) Try server export
             save_path = OUT / f"{filename} {stamp}.pdf"
-            ok = await download_pdf_from_panel(panel, save_path, settle_ms=5600, min_bytes=7000)
+            ok, size = await download_pdf_from_panel(panel, save_path, settle_ms=5600)
 
-            # 2) Fallback: locally print the on-screen panel to PDF if server export is blank
-            if not ok:
-                log("[pdf:fallback] server export looked empty — printing panel to PDF.")
-                save_path = OUT / f"{filename} {stamp}.pdf"  # same name
+            # 2) If blank (or failed), print the panel to PDF locally
+            if (not ok) or (size < MIN_VALID_PDF_BYTES):
+                if ok:
+                    log(f"[pdf] server export looks blank ({size} bytes < {MIN_VALID_PDF_BYTES}); using print fallback.")
+                else:
+                    log("[pdf] server export failed; using print fallback.")
                 await render_panel_to_pdf(panel, save_path)
 
             log(f"Saved {save_path.name}")
