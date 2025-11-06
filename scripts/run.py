@@ -414,22 +414,81 @@ async def wait_for_report_table(p, timeout_ms=30000):
         except Exception:
             return False
 
-# ===================== SHOW REPORT & PDF =====================
+# ===================== PERIOD DETECTION + SHOW REPORT =====================
 
-async def show_report_and_wait(page):
-    await click_first(page, [
+async def _read_period_text(page) -> str:
+    try:
+        sel_candidates = [
+            "xpath=//*[contains(normalize-space(),'Period:')][1]",
+            "xpath=//*[contains(@id,'period')][1]",
+            "xpath=//div[contains(.,'Period:')][1]",
+        ]
+        for s in sel_candidates:
+            if await page.locator(s).count():
+                txt = (await page.locator(s).first.inner_text()).strip()
+                if txt:
+                    return " ".join(txt.split())
+    except Exception:
+        pass
+    return ""
+
+def _looks_like_dated_period(text: str) -> bool:
+    if not text: return False
+    if "period" not in text.lower(): return False
+    # capture date-ish tokens like 2024-07-26, 26/07/2024, 26-07-2024
+    dates = re.findall(r"\b(\d{2,4}[-/]\d{1,2}[-/]\d{2,4})\b", text)
+    return len(dates) >= 2
+
+async def show_report_and_wait(page, *, click_timeout=8000, network_timeout=30000):
+    # Try normal click first
+    clicked = await click_first(page, [
         "button:has-text('Show Report')",
         "input[type='button'][value='Show Report']",
+        "input[type='submit'][value='Show Report']",
         "text=Show Report"
-    ], timeout=8000)
+    ], timeout=click_timeout)
 
-    ok = await _wait_for_data_rows(page, timeout_ms=30000)
-    if not ok:
+    # JS fallback: force the bound handler
+    if not clicked:
         try:
-            await page.get_by_text("No record", exact=False).wait_for(timeout=3000)
-            return
+            clicked = await page.evaluate("""
+            () => {
+              const norm = s => (s||'').trim().toLowerCase();
+              const btns = Array.from(document.querySelectorAll('button,input[type=button],input[type=submit]'));
+              const el = btns.find(b => norm(b.innerText||b.value||'') === 'show report' ||
+                                        norm(b.innerText||b.value||'').includes('show report'));
+              if (!el) return false;
+              el.click();
+              return true;
+            }
+            """)
         except Exception:
-            raise RuntimeError("Report table did not populate with data rows.")
+            clicked = False
+    if not clicked:
+        raise RuntimeError("Could not click Show Report")
+
+    # Wait for a plausible report response
+    try:
+        await page.wait_for_response(
+            lambda r: any(k in (r.url or '').lower() for k in [
+                "applicationwisereport", "appwisereport", "getreport", "reportdata", "report"
+            ]) and r.ok,
+            timeout=network_timeout
+        )
+    except Exception:
+        pass  # continue to DOM checks
+
+    # Require either a proper Period line with two dates OR data rows
+    for _ in range(60):  # ~18s
+        period = await _read_period_text(page)
+        if _looks_like_dated_period(period):
+            return True
+        if await _has_data_rows(page):
+            return True
+        await asyncio.sleep(0.3)
+    return False
+
+# ===================== PDF CONTROLS =====================
 
 async def click_report_pdf_icon(page):
     candidates = [
@@ -647,7 +706,23 @@ async def site_login_and_download():
                 await set_first_input_value(p, TO_DATE_CANDIDATES, captured_to)
             log(f"[dates] before Show Report: From='{await get_first_input_value(p, FROM_DATE_CANDIDATES)}' To='{await get_first_input_value(p, TO_DATE_CANDIDATES)}'")
 
-            await show_report_and_wait(p)
+            # Must successfully re-run Show Report and see a dated Period OR data rows
+            ok_show = await show_report_and_wait(p)
+            if not ok_show:
+                if captured_from and captured_to:
+                    await set_first_input_value(p, FROM_DATE_CANDIDATES, captured_from)
+                    await set_first_input_value(p, TO_DATE_CANDIDATES, captured_to)
+                    log("[A] Re-applying dates and retrying Show Report once…")
+                    ok_show = await show_report_and_wait(p)
+            if not ok_show:
+                period_dbg = await _read_period_text(p)
+                raise RuntimeError(f"[A] Show Report did not produce data. Period text seen: '{period_dbg}'")
+
+            # Refuse to export if Period still lacks dates (prevents header-only PDFs)
+            period_now = await _read_period_text(p)
+            if not _looks_like_dated_period(period_now):
+                raise RuntimeError(f"[A] Period line lacks dates after Show Report: '{period_now}'")
+
             await snap(p, f"after_grid_shown_{status_text.lower()}.png")
 
             ok_dl = await download_report_pdf_with_checks(
