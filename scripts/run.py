@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, re, base64, time, json
+import os, sys, asyncio, traceback, re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Tuple
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 from dotenv import load_dotenv
@@ -14,558 +13,35 @@ OUT.mkdir(exist_ok=True)
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
 
-# === Date helpers ===
-IST = timezone(timedelta(hours=5, minutes=30))
-def now_ist() -> datetime:
-    return datetime.now(IST)
-
-def today_for_filename() -> str:
-    return now_ist().strftime("%d-%m-%Y")  # for file name only
-
-def ist_today_variants():
-    d = now_ist()
-    return (
-        d.strftime("%Y-%m-%d"),  # 2025-11-06
-        d.strftime("%d-%m-%Y"),  # 06-11-2025
-        d.strftime("%d/%m/%Y"),  # 06/11/2025
-    )
-
-FROM_FIXED_DATE_VARIANTS = ("2024-07-26", "26-07-2024", "26/07/2024")
-
-# treat anything below this size as blank/header-only export
-MIN_VALID_PDF_BYTES = 50000
+def today_str():
+    # dd-mm-yyyy
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%d-%m-%Y")
 
 def log(msg): print(msg, flush=True)
 
 async def snap(page, name, full=False):
-    if not DEBUG: return
-    try: await page.screenshot(path=str(OUT / name), full_page=bool(full))
-    except Exception: pass
-
-# ===================== PANEL FINDER =====================
-
-async def get_app_panel(page):
-    panel = page.locator(
-        "xpath=//div[.//text()[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),"
-        "'application wise report')]]"
-    ).first
-    await panel.wait_for(state="visible", timeout=15000)
-    return panel
-
-# ===================== BOOTSTRAP-SELECT + NATIVE HELPERS =====================
-
-def _label_xpath_ci(label_text: str) -> str:
-    return (
-        "contains("
-        "translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), "
-        f"translate('{label_text}', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz')"
-        ")"
-    )
-
-async def _bs_find_toggle_in_root(root, label_text: str):
-    xp = (
-        f".//label[{_label_xpath_ci(label_text)}]"
-        f"/following::*[contains(@class,'bootstrap-select')][1]"
-        f"//button[contains(@class,'dropdown-toggle')]"
-    )
-    return root.locator(f"xpath={xp}").first
-
-async def _bs_find_toggle_by_text_any(root, needle_regex: str):
-    btns = root.locator(".bootstrap-select .dropdown-toggle")
-    count = await btns.count()
-    rx = re.compile(needle_regex, re.I)
-    for i in range(count):
-        b = btns.nth(i)
-        try:
-            txt = (await b.inner_text() or "").strip()
-        except Exception:
-            txt = ""
-        if rx.search(txt):
-            return b
-    return root.locator("__never__")
-
-async def _bs_wait_button_text_in_root(root, label_text: str, expect_text: str, timeout_ms=6000):
-    btn = await _bs_find_toggle_in_root(root, label_text)
+    if not DEBUG:
+        return
     try:
-        await btn.wait_for(timeout=timeout_ms)
-        inner = btn.locator(".filter-option-inner-inner").first
-        tgt = inner if await inner.count() else btn
-        await root.page.wait_for_function(
-            """(el, want) => (el && (el.innerText||'').trim().toLowerCase().includes((want||'').toLowerCase()))""",
-            tgt, expect_text, timeout=timeout_ms
-        )
-        return True
-    except Exception:
-        return False
-
-async def _close_dropdown_like_human(page):
-    try: await page.keyboard.press("Escape")
-    except Exception: pass
-    try: await page.mouse.click(1, 1)
-    except Exception: pass
-    await asyncio.sleep(0.15)
-
-async def bs_select_option_in_root(root, label_text: str, option_text: str) -> bool:
-    btn = await _bs_find_toggle_in_root(root, label_text)
-    if not await btn.count():
-        return False
-
-    await btn.scroll_into_view_if_needed()
-    await btn.click(timeout=6000)
-
-    menu = root.page.locator(".dropdown-menu.show, .show .dropdown-menu").first
-    try:
-        await menu.wait_for(timeout=5000)
-    except Exception:
-        await _close_dropdown_like_human(root.page)
-        return False
-
-    item = menu.locator("li, a, span, .text").filter(has_text=option_text).first
-    if not await item.count():
-        for _ in range(16):
-            try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
-            except Exception: pass
-            cand = menu.locator("li, a, span, .text").filter(has_text=option_text).first
-            if await cand.count():
-                item = cand; break
-
-    if not await item.count():
-        await _close_dropdown_like_human(root.page)
-        return False
-
-    await item.scroll_into_view_if_needed()
-    await item.click(timeout=6000, force=True)
-    await _close_dropdown_like_human(root.page)
-
-    ok = await _bs_wait_button_text_in_root(root, label_text, option_text, timeout_ms=6000)
-    return ok
-
-NATIVE_SELECT_JS = """
-(root, args) => {
-  const { labelText, wanted } = args;
-  const norm = s => (s||'').trim().toLowerCase();
-  const wantedNorm = norm(wanted);
-
-  let label = Array.from(root.querySelectorAll('label'))
-    .find(l => norm(l.textContent).includes(norm(labelText)));
-  let sel = null;
-  if (label) {
-    const forId = label.getAttribute('for');
-    if (forId) sel = root.querySelector('#'+CSS.escape(forId));
-    if (!sel) {
-      sel = (label.nextElementSibling && label.nextElementSibling.tagName === 'SELECT')
-        ? label.nextElementSibling
-        : (label.closest('div') || root).querySelector('select');
-    }
-  } else {
-    sel = (root.querySelector('select'));
-  }
-  if (!sel) return {ok:false, reason:'select not found'};
-
-  let idx = -1;
-  for (let i=0;i<sel.options.length;i++){
-    const t = norm(sel.options[i].textContent);
-    if (t.includes(wantedNorm)) { idx = i; break; }
-  }
-  if (idx === -1) return {ok:false, reason:'option not found'};
-
-  sel.selectedIndex = idx;
-  sel.dispatchEvent(new Event('input',{bubbles:true}));
-  sel.dispatchEvent(new Event('change',{bubbles:true}));
-  return {ok:true, text: sel.options[idx].textContent.trim()};
-}
-"""
-
-async def native_select_option_in_root(root, label_text: str, option_text: str) -> bool:
-    try:
-        res = await root.evaluate(NATIVE_SELECT_JS, {"labelText": label_text, "wanted": option_text})
-        return bool(res and res.get("ok"))
-    except Exception:
-        return False
-
-async def select_option_any(panel, page, label_text: str, option_text: str) -> bool:
-    ok = await bs_select_option_in_root(panel, label_text, option_text)
-    if ok:
-        log(f"[filter] {label_text} → {option_text} (panel bootstrap)")
-        return True
-    ok = await native_select_option_in_root(panel, label_text, option_text)
-    if ok:
-        log(f"[filter] {label_text} → {option_text} (panel native)")
-        return True
-    ok = await bs_select_option_in_root(page, label_text, option_text)
-    if ok:
-        log(f"[filter] {label_text} → {option_text} (page bootstrap)")
-        return True
-    ok = await native_select_option_in_root(page, label_text, option_text)
-    if ok:
-        log(f"[filter] {label_text} → {option_text} (page native)")
-        return True
-    try:
-        found = await page.evaluate("""
-          (wanted) => {
-            const norm = s => (s||'').trim().toLowerCase();
-            const w = norm(wanted);
-            const selects = Array.from(document.querySelectorAll('select'));
-            for (const sel of selects) {
-              let idx = -1;
-              for (let i=0;i<sel.options.length;i++){
-                const t = norm(sel.options[i].textContent);
-                if (t.includes(w)){ idx=i; break; }
-              }
-              if (idx !== -1) {
-                sel.selectedIndex = idx;
-                sel.dispatchEvent(new Event('input',{bubbles:true}));
-                sel.dispatchEvent(new Event('change',{bubbles:true}));
-                return true;
-              }
-            }
-            return false;
-          }
-        """, option_text)
-        if found:
-            log(f"[filter] {label_text} → {option_text} (any-select fallback)")
-            return True
-    except Exception:
-        pass
-    log(f"[filter] {label_text} FAILED to set '{option_text}' (all methods).")
-    return False
-
-# ====== Nature Of Application (Select All) — robust ======
-async def select_nature_all(panel, page) -> bool:
-    # 1) true-label bootstrap or any bootstrap with 'nature'
-    btn = await _bs_find_toggle_in_root(panel, "Nature Of Application")
-    if not await btn.count():
-        btn = await _bs_find_toggle_by_text_any(panel, r"\bnature\b")
-    if not await btn.count():
-        btn = await _bs_find_toggle_in_root(page, "Nature Of Application")
-        if not await btn.count():
-            btn = await _bs_find_toggle_by_text_any(page, r"\bnature\b")
-
-    if await btn.count():
-        await btn.scroll_into_view_if_needed()
-        await btn.click(timeout=6000)
-        menu = page.locator(".dropdown-menu.show, .show .dropdown-menu").first
-        try:
-            await menu.wait_for(timeout=4000)
-        except Exception:
-            await _close_dropdown_like_human(page)
-        # Prefer explicit "Select All"
-        sel_all = menu.locator("li, a, span, .text").filter(has_text=re.compile(r"select\s*all", re.I)).first
-        clicked = False
-        if await sel_all.count():
-            try:
-                await sel_all.click(timeout=5000, force=True)
-                clicked = True
-            except Exception:
-                clicked = False
-        else:
-            vis = menu.locator("li:not(.disabled) a, li:not(.disabled) .text")
-            cnt = await vis.count()
-            for i in range(min(cnt, 20)):
-                try:
-                    await vis.nth(i).click(timeout=600)
-                    clicked = True
-                except Exception:
-                    pass
-        await _close_dropdown_like_human(page)
-
-        try:
-            inner = btn.locator(".filter-option-inner-inner").first
-            txt = (await inner.inner_text() if await inner.count() else await btn.inner_text()).strip().lower()
-        except Exception:
-            txt = ""
-        ok = clicked and ("none selected" not in txt)
-        log(f"[filter] Nature Of Application → Select All (bootstrap heuristic ok={ok})")
-        if ok: return True
-
-    # 2) Native multi-select select-all
-    try:
-        ok = await panel.evaluate("""
-          (root) => {
-            const norm = s => (s||'').trim().toLowerCase();
-            const blocks = Array.from(root.querySelectorAll('div, section, form, fieldset'));
-            let target = null;
-            for (const b of blocks) {
-              const t = norm(b.textContent);
-              if (t.includes('nature') && b.querySelector('select')) { target = b; break; }
-            }
-            const sel = target ? target.querySelector('select') : root.querySelector('select[multiple]');
-            if (!sel) return false;
-            let changed = false;
-            for (const o of sel.options) { if (!o.selected) { o.selected = true; changed = true; } }
-            if (changed) {
-              sel.dispatchEvent(new Event('input',{bubbles:true}));
-              sel.dispatchEvent(new Event('change',{bubbles:true}));
-            }
-            return true;
-          }
-        """)
-        log(f"[filter] Nature Of Application → Select All (native heuristic ok={ok})")
-        return bool(ok)
-    except Exception:
-        pass
-    return False
-
-# ====== Division wait after Circle ======
-async def wait_until_option_exists_any_select(page, option_text: str, timeout_ms: int = 20000) -> bool:
-    deadline = time.time() + timeout_ms/1000
-    while time.time() < deadline:
-        try:
-            exists = await page.evaluate("""
-              (wanted) => {
-                const norm = s => (s||'').trim().toLowerCase();
-                const w = norm(wanted);
-                for (const sel of document.querySelectorAll('select')) {
-                  for (const opt of sel.options) {
-                    if (norm(opt.textContent).includes(w)) return true;
-                  }
-                }
-                return false;
-              }
-            """, option_text)
-            if exists:
-                return True
-        except Exception:
-            pass
-        await asyncio.sleep(0.2)
-    return False
-
-async def wait_division_options_after_circle(page, target_division_text: str, max_wait_ms: int = 20000):
-    async def wait_response():
-        try:
-            await page.wait_for_response(
-                lambda r: any(k in (r.url or '').lower() for k in (
-                    "division", "getdivision", "bycircle", "divisionlist", "getdivisions"
-                )),
-                timeout=max_wait_ms
-            )
-        except Exception:
-            pass
-    await asyncio.gather(wait_response(), wait_until_option_exists_any_select(page, target_division_text, max_wait_ms))
-
-# ===================== DATE INPUTS =====================
-
-DATE_FILL_JS = """
-(root, args) => {
-  const { fromVal, toVal } = args;
-  const setOne = (sel, v) => {
-    const el = root.querySelector(sel);
-    if (!el) return false;
-    el.value = v;
-    el.dispatchEvent(new Event('input',{bubbles:true}));
-    el.dispatchEvent(new Event('change',{bubbles:true}));
-    try { el.dispatchEvent(new Event('changed.bs.select',{bubbles:true})); } catch(e) {}
-    return true;
-  };
-  let okFrom = false, okTo = false;
-  const fromCandidates = ['#fromDate','input[name="fromDate"]','input[name*="fromdate" i]','input[placeholder*="From" i]'];
-  const toCandidates   = ['#toDate','input[name="toDate"]','input[name*="todate" i]','input[placeholder*="To" i]'];
-  for (const c of fromCandidates) if (setOne(c, fromVal)) { okFrom = true; break; }
-  for (const c of toCandidates)   if (setOne(c, toVal))   { okTo = true; break; }
-  return {okFrom, okTo};
-}
-"""
-
-async def panel_has_rows(panel):
-    try:
-        return await panel.evaluate("""
-          (root)=>{
-            const tbs = root.querySelectorAll('table tbody');
-            for(const tb of tbs){
-              for(const tr of tb.querySelectorAll('tr')){
-                const tds = Array.from(tr.querySelectorAll('td')).map(td=>(td.innerText||'').trim());
-                if (tds.filter(x=>x).length>=2) return true;
-              }
-            }
-            return false;
-          }
-        """)
-    except Exception:
-        return False
-
-# ===================== SHOW REPORT =====================
-
-async def show_report_and_wait(panel, *, settle_ms=5600, response_wait_ms=12000):
-    clicked = False
-    for sel in [
-        "button:has-text('Show Report')",
-        "input[type='button'][value='Show Report']",
-        "input[type='submit'][value='Show Report']",
-    ]:
-        try:
-            loc = panel.locator(sel).first
-            if await loc.count():
-                await loc.scroll_into_view_if_needed()
-                await loc.click(timeout=6000)
-                clicked = True
-                break
-        except Exception:
-            pass
-    if not clicked:
-        clicked = await panel.evaluate("""
-          (root)=>{
-            const norm=s=>(s||'').trim().toLowerCase();
-            const btn=[...root.querySelectorAll('button,input[type=button],input[type=submit]')]
-              .find(b=>{const t=norm(b.innerText||b.value||''); return t==='show report'||t.includes('show report');});
-            if(!btn) return false; btn.click(); return true;
-          }
-        """)
-    if not clicked:
-        raise RuntimeError("Show Report button not found in panel")
-
-    try:
-        await panel.page.wait_for_response(
-            lambda r: any(k in (r.url or '').lower() for k in (
-                "applicationwisereport","appwisereport","getreport","reportdata","report"
-            )),
-            timeout=response_wait_ms
-        )
+        await page.screenshot(path=str(OUT / name), full_page=bool(full))
     except Exception:
         pass
 
-    await asyncio.sleep(settle_ms/1000)
-    return await panel_has_rows(panel)
-
-async def click_pdf_icon(panel):
-    for sel in [
-        "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')][ancestor::div[.//button[contains(.,'Show Report')]]]",
-        "xpath=(.//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
-        "xpath=(.//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
-    ]:
-        ico = panel.locator(sel).first
-        if await ico.count():
-            await ico.scroll_into_view_if_needed()
-            await ico.click(timeout=6000, force=True)
-            return True
-    return False
-
-# ===================== Request capture & replay =====================
-
-class RequestSniffer:
-    def __init__(self, page):
-        self.page = page
-        self.events: List[Dict[str, Any]] = []
-        self._req_handler = None
-        self._resp_handler = None
-
-    async def __aenter__(self):
-        async def on_request(req):
-            try:
-                body = None
-                try: body = req.post_data()
-                except Exception: body = None
-                self.events.append({
-                    "type":"request",
-                    "time": time.time(),
-                    "url": req.url,
-                    "method": req.method,
-                    "headers": dict(req.headers),
-                    "post_data": body
-                })
-            except Exception: pass
-
-        async def on_response(resp):
-            try:
-                hdrs = {}
-                try: hdrs = dict(resp.headers)
-                except Exception: hdrs = {}
-                self.events.append({
-                    "type":"response",
-                    "time": time.time(),
-                    "url": resp.url,
-                    "status": resp.status,
-                    "headers": hdrs
-                })
-            except Exception: pass
-
-        self._req_handler = self.page.on("request", on_request)
-        self._resp_handler = self.page.on("response", on_response)
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if self._req_handler: self.page.off("request", self._req_handler)
-        if self._resp_handler: self.page.off("response", self._resp_handler)
-
-    def find_pdf_exchange(self) -> Tuple[Optional[Dict[str,Any]], Optional[Dict[str,Any]]]:
-        cand_resp = None
-        for ev in reversed(self.events):
-            if ev.get("type") == "response":
-                url_l = (ev.get("url") or "").lower()
-                h = {k.lower():v for k,v in (ev.get("headers") or {}).items()}
-                ctype = h.get("content-type","").lower()
-                if "pdf" in ctype or any(x in ctype for x in ("application/pdf",)) or any(x in url_l for x in ("pdf","export","download","report")):
-                    cand_resp = ev
-                    break
-        if not cand_resp:
-            return (None, None)
-
-        cand_req = None
-        for ev in reversed(self.events):
-            if ev.get("type") == "request" and (ev.get("url")==cand_resp.get("url")):
-                cand_req = ev; break
-        if not cand_req:
-            base = cand_resp.get("url","")
-            base_key = re.sub(r"\?.*$","", base)
-            for ev in reversed(self.events):
-                if ev.get("type")=="request" and ev.get("method") in ("POST","GET"):
-                    u = ev.get("url","")
-                    if re.sub(r"\?.*$","", u) == base_key:
-                        cand_req = ev; break
-        return (cand_req, cand_resp)
-
-async def safe_replay_pdf(context, req_event: Dict[str,Any], save_path: Path) -> bool:
-    if not req_event: return False
-    url = req_event.get("url")
-    method = (req_event.get("method") or "GET").upper()
-    headers = dict(req_event.get("headers") or {})
-    body = req_event.get("post_data")
-
-    for k in ["content-length","host","origin","referer","cookie","sec-fetch-site","sec-fetch-mode",
-              "sec-fetch-dest","sec-ch-ua","sec-ch-ua-platform","sec-ch-ua-mobile","user-agent"]:
-        headers.pop(k, None)
-
-    try:
-        if method == "POST":
-            resp = await context.request.post(url, data=body, headers=headers)
-        else:
-            resp = await context.request.get(url, headers=headers)
-    except Exception as e:
-        log(f"[replay] fetch error: {e}")
-        return False
-
-    if not resp.ok:
-        log(f"[replay] HTTP {resp.status} on replay")
-        return False
-
-    ctype = (resp.headers.get("content-type","") or "").lower()
-    if "pdf" not in ctype:
-        log(f"[replay] Not a PDF content-type: {ctype}")
-        return False
-
-    try:
-        b = await resp.body()
-        Path(save_path).write_bytes(b)
-        log(f"[replay] saved real PDF → {save_path} ({len(b)} bytes)")
-        return True
-    except Exception as e:
-        log(f"[replay] write error: {e}")
-        return False
-
-# ===================== DOWNLOAD / FALLBACKS =====================
-
-async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=35000):
+# ---------------- PDF download (bounded; popup fallback) ----------------
+async def click_and_wait_download(p, click_pdf, save_as_path, timeout_ms=35000):
     log("[pdf] trying direct download…")
     try:
-        async with page.expect_download(timeout=timeout_ms) as dl_info:
+        async with p.expect_download(timeout=timeout_ms) as dl_info:
             await click_pdf()
         dl = await dl_info.value
         await dl.save_as(save_as_path)
         log(f"[pdf] saved → {save_as_path}")
         return True
     except Exception as e:
-        log(f"[pdf] direct download failed ({e}); popup fallback…")
+        log(f"[pdf] no direct download ({e}); trying popup…")
         try:
-            async with page.expect_popup(timeout=5000) as pop_info:
+            async with p.expect_popup(timeout=5000) as pop_info:
                 await click_pdf()
             pop = await pop_info.value
             await pop.wait_for_load_state("load")
@@ -579,333 +55,572 @@ async def click_and_wait_download(page, click_pdf, save_as_path, timeout_ms=3500
                 log(f"[pdf] popup → saved → {save_as_path}")
                 return True
             await pop.close()
+            return False
         except Exception as e2:
             log(f"[pdf] popup fallback failed: {e2}")
-        return False
+            return False
 
-async def download_pdf_via_capture_and_replay(panel, save_path: Path, *, settle_ms=5600) -> Tuple[bool,int]:
-    page = panel.page
-    context = page.context
-    if settle_ms>0:
-        await asyncio.sleep(settle_ms/1000)
-
-    async def do_click():
-        ok = await click_pdf_icon(panel)
-        if not ok:
-            raise RuntimeError("PDF icon not found in panel")
-
-    ok = False
-    size = 0
-    async with RequestSniffer(page) as sniff:
-        ok = await click_and_wait_download(page, do_click, save_as_path=save_path, timeout_ms=35000)
-        if ok:
-            try:
-                size = Path(save_path).stat().st_size
-                log(f"[pdf] size: {size} bytes")
-            except FileNotFoundError:
-                size = 0
-
-        if (not ok) or (size < MIN_VALID_PDF_BYTES):
-            req_ev, resp_ev = sniff.find_pdf_exchange()
-            if not req_ev and not resp_ev:
-                log("[replay] No PDF-like network exchange captured.")
-                return (ok, size)
-            target = req_ev or {}
-            r_ok = await safe_replay_pdf(context, target, save_path)
-            if r_ok:
-                try:
-                    size = Path(save_path).stat().st_size
-                except FileNotFoundError:
-                    size = 0
-                return (True, size)
-    return (ok, size)
-
-# ====== DOM → PDF (crisp, selectable) ======
-async def render_panel_dom_to_pdf(panel, pdf_path: Path):
-    """
-    Clone the panel DOM (including Period line and table) into a new page
-    with print CSS and render a proper text PDF.
-    """
-    page = panel.page
-    # Extract innerHTML of the panel + try to read a 'Period:' line if any
-    payload = await panel.evaluate("""
-      (root) => {
-        const html = root.outerHTML;
-        let period = '';
-        const candidates = Array.from(root.querySelectorAll('*'))
-          .filter(n => (n.textContent||'').toLowerCase().includes('period:'));
-        if (candidates.length) {
-          period = candidates[0].textContent.trim();
-        }
-        // Also capture selected filter badges/text if visible on buttons
-        const info = {};
-        const btns = Array.from(root.querySelectorAll('.bootstrap-select .dropdown-toggle'));
-        for (const b of btns) {
-          const key = (b.getAttribute('aria-label') || b.title || '').trim() ||
-                      (b.closest('div')?.previousElementSibling?.innerText?.trim() || '');
-          const inner = b.querySelector('.filter-option-inner-inner');
-          const val = (inner?.innerText || b.innerText || '').trim();
-          if (key && val) info[key] = val;
-        }
-        return { html, period, info };
-      }
-    """)
-    raw_html = payload.get("html","")
-    period_line = payload.get("period","")
-    info = payload.get("info",{}) or {}
-
-    # Build a clean printable HTML (no external CSS)
-    filters_badge = ""
-    if info:
-        items = [f"<li><strong>{k}:</strong> {v}</li>" for k,v in info.items()]
-        filters_badge = f"<div class='meta'><h3>Selected Filters</h3><ul>{''.join(items)}</ul></div>"
-    elif period_line:
-        filters_badge = f"<div class='meta'><h3>{period_line}</h3></div>"
-
-    html = f"""<!doctype html>
-<html>
-<head>
-<meta charset="utf-8"/>
-<title>Report</title>
-<style>
-  @page {{ size:A4; margin:12mm; }}
-  body {{ font-family: Arial, Helvetica, sans-serif; font-size: 12px; color:#111; }}
-  h1 {{ font-size: 18px; margin:0 0 8px 0; }}
-  .meta {{ margin: 0 0 10px 0; }}
-  .meta ul {{ margin: 6px 0 0 18px; }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ border: 1px solid #999; padding: 6px 8px; vertical-align: top; }}
-  th {{ background:#f2f2f2; }}
-  /* try to force wide tables to wrap/fit */
-  td, th {{ word-break: break-word; }}
-</style>
-</head>
-<body>
-  <h1>Application Wise Report</h1>
-  {filters_badge}
-  <div id="panel">
-    {raw_html}
-  </div>
-  <script>
-    // Remove nested buttons/inputs from the cloned panel (just display)
-    const panel = document.querySelector('#panel');
-    panel.querySelectorAll('button, input, select').forEach(el => el.remove());
-  </script>
-</body>
-</html>"""
-
-    ctx = page.context
-    tmp = await ctx.new_page()
-    await tmp.set_content(html, wait_until="load")
-    await tmp.emulate_media(media="print")
-    await tmp.pdf(path=str(pdf_path), format="A4", print_background=True)
-    await tmp.close()
-    log(f"[pdf:dom] panel HTML rendered to → {pdf_path}")
-
-# ====== Screenshot → PDF (last resort) ======
-async def render_panel_via_screenshot_to_pdf(panel, pdf_path: Path):
-    page = panel.page
-    png_bytes = await panel.screenshot(type="png")
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-
-    ctx = page.context
-    tmp = await ctx.new_page()
-    html = f"""<!doctype html><html><head><meta charset="utf-8"/><title>Report</title>
-    <style>html,body{{margin:0;padding:0}}.wrap{{width:100%;box-sizing:border-box;padding:8mm}}img{{width:100%;height:auto;display:block}}</style>
-    </head><body><div class="wrap"><img src="data:image/png;base64,{b64}" alt="report"/></div></body></html>"""
-    await tmp.set_content(html, wait_until="load")
-    await tmp.emulate_media(media="print")
-    await tmp.pdf(path=str(pdf_path), format="A4", margin={"top":"0","right":"0","bottom":"0","left":"0"}, print_background=True)
-    await tmp.close()
-    log(f"[pdf:fallback] panel screenshot rendered to → {pdf_path}")
-
-# ===================== DATES =====================
-
-async def set_dates_and_show(panel, *, settle_ms_first=5600):
-    to_variants = ist_today_variants()
-    tries = [(f,t) for f in FROM_FIXED_DATE_VARIANTS for t in to_variants]
-
-    for idx, (from_val, to_val) in enumerate(tries, start=1):
+# ---------------- small helpers ----------------
+async def fill_first(page, candidates, value):
+    for sel in candidates:
         try:
-            res = await panel.evaluate(DATE_FILL_JS, {"fromVal": from_val, "toVal": to_val})
-            log(f"[dates] try {idx}: From='{from_val}' To='{to_val}' set={res}")
-        except Exception as e:
-            log(f"[dates] set error on try {idx}: {e}")
-
-        has_rows = await show_report_and_wait(panel, settle_ms=settle_ms_first if idx==1 else 3000, response_wait_ms=8000)
-        if has_rows:
-            log(f"[dates] data present with format try {idx}")
-            return True
-        log(f"[dates] no rows with try {idx}; trying next format…")
+            if await page.locator(sel).count():
+                await page.fill(sel, value); return True
+        except Exception: pass
     return False
 
-# ===================== MAIN FLOW =====================
+async def click_first(page, candidates, timeout=3000):
+    for sel in candidates:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.click(timeout=timeout); return True
+        except Exception: pass
+    return False
 
+async def _dump_near(p, label_text: str, tag: str):
+    if not DEBUG:
+        return
+    try:
+        html = await p.evaluate(
+            """(txt)=>{
+              const L=[...document.querySelectorAll('label')].find(l=>(l.textContent||'').trim().toLowerCase().includes(txt.toLowerCase()));
+              const el=L?.closest('div')||L?.parentElement||document.body;
+              return (el?.outerHTML||'').slice(0,8000);
+            }""", label_text
+        )
+        (OUT / f"debug_near_{tag}.html").write_text(html or "", encoding="utf-8")
+    except Exception: pass
+
+# --- read displayed value near label (bootstrap/native) ---
+async def read_display_value_near_label(p, label_text: str):
+    try:
+        txt = await p.evaluate(
+            """(labelText) => {
+                const norm = s => (s||'').trim().toLowerCase();
+                const label = Array.from(document.querySelectorAll('label'))
+                  .find(l => norm(l.textContent).includes(norm(labelText)));
+                if (!label) return null;
+                const root = label.closest('div') || label.parentElement || document.body;
+
+                const btn = root.querySelector('.bootstrap-select .dropdown-toggle, button.dropdown-toggle');
+                if (btn) {
+                  const inner = btn.querySelector('.filter-option-inner-inner') || btn;
+                  const t = (inner.textContent || '').trim();
+                  if (t) return t;
+                }
+                const sel = root.querySelector('select');
+                if (sel && sel.selectedIndex >= 0) {
+                  const opt = sel.options[sel.selectedIndex];
+                  if (opt) return (opt.textContent || '').trim();
+                }
+                return null;
+            }""",
+            label_text
+        )
+        return (txt or "").strip()
+    except Exception:
+        return ""
+
+# --- wait for network/response helpers (fast & specific) ---
+def _resp_matcher(substrings):
+    low = [s.lower() for s in substrings]
+    def _inner(resp):
+        try:
+            url = resp.url.lower()
+            return any(s in url for s in low)
+        except Exception:
+            return False
+    return _inner
+
+async def wait_for_any_response(p, substrings, timeout_ms=10000):
+    try:
+        await p.wait_for_response(_resp_matcher(substrings), timeout=timeout_ms)
+        return True
+    except Exception:
+        return False
+
+async def get_options_count(p, select_css: str):
+    try:
+        return await p.eval_on_selector(select_css, "s => s ? s.options.length : 0")
+    except Exception:
+        return 0
+
+async def wait_options_increase(p, select_css: str, min_count=2, timeout_ms=8000):
+    end = asyncio.get_event_loop().time() + timeout_ms/1000.0
+    while asyncio.get_event_loop().time() < end:
+        cnt = await get_options_count(p, select_css)
+        if cnt >= min_count:
+            return True
+        await asyncio.sleep(0.1)
+    return False
+
+# --- select helpers (native / bootstrap) ---
+async def _native_select(p, label_text: str, id_candidates, name_candidates, option_text: str):
+    label_based = [
+        f"label:has-text('{label_text}') + select",
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::select[1]",
+        f"text={label_text} >> xpath=following::select[1]",
+    ]
+    for sel in label_based:
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_text); return True, sel
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_text); return True, sel
+                except Exception: pass
+    for key in id_candidates:
+        sel = f"select#{key}"
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_text); return True, sel
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_text); return True, sel
+                except Exception: pass
+    for key in name_candidates:
+        sel = f"select[name='{key}'], select[name*='{key}']"
+        if await p.locator(sel).count():
+            try:
+                await p.select_option(sel, label=option_text); return True, sel
+            except Exception:
+                try:
+                    await p.select_option(sel, value=option_text); return True, sel
+                except Exception: pass
+    return False, None
+
+async def _bootstrap_select(p, label_text: str, option_text: str):
+    toggle_candidates = [
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]",
+        f"label:has-text('{label_text}') + * button.dropdown-toggle",
+        f"xpath=//label[contains(normalize-space(), '{label_text}')]/following::button[contains(@class,'dropdown-toggle')][1]",
+    ]
+    for tsel in toggle_candidates:
+        if await p.locator(tsel).count():
+            try:
+                btn = p.locator(tsel).first
+                await btn.scroll_into_view_if_needed()
+                await btn.click()
+                menu = p.locator(".dropdown-menu.show, .show .dropdown-menu").first
+                await menu.wait_for(timeout=5000)
+
+                found = False
+                for _ in range(20):
+                    candidate = menu.locator("li, a, span, .text").filter(has_text=option_text).first
+                    if await candidate.count():
+                        await candidate.scroll_into_view_if_needed()
+                        await candidate.click(timeout=5000, force=True)
+                        found = True
+                        break
+                    try: await menu.evaluate("(m)=>m.scrollBy(0,250)")
+                    except Exception: pass
+
+                try: await p.keyboard.press("Escape")
+                except Exception: pass
+                if found: return True
+            except Exception:
+                try: await p.keyboard.press("Escape")
+                except Exception: pass
+    return False
+
+# --- specific selectors for each dropdown ---
+async def select_circle(p, option_text: str):
+    log(f"[filter] Circle Office → {option_text}")
+    ok, sel = await _native_select(
+        p, "Circle Office",
+        id_candidates=["circle", "circleId", "circleOffice", "circle_office"],
+        name_candidates=["circle", "circleId", "circleOffice", "circle_office"],
+        option_text=option_text
+    )
+    if ok:
+        await snap(p, "after_select_circle.png")
+        return True
+    ok = await _bootstrap_select(p, "Circle Office", option_text)
+    await _dump_near(p, "Circle Office", "circle")
+    await snap(p, "after_select_circle.png")
+    return ok
+
+# ⚡ Division selection: wait for the actual XHR + options growth
+async def select_division(p, option_text: str):
+    log(f"[filter] Division Office → {option_text}")
+    label_selects = [
+        "label:has-text('Division Office') + select",
+        "xpath=//label[contains(normalize-space(),'Division Office')]/following::select[1]"
+    ]
+    native_sel = None
+    for css in label_selects:
+        if await p.locator(css).count():
+            native_sel = css
+            break
+    if not native_sel:
+        for css in ["select#division","select#divisionId","select#divisionOffice",
+                    "select[name='division']","select[name*='division']"]:
+            if await p.locator(css).count():
+                native_sel = css
+                break
+    if native_sel:
+        wait_resp = wait_for_any_response(
+            p,
+            substrings=["division", "getDivision", "bycircle", "divisionList", "getdivisions"],
+            timeout_ms=7000
+        )
+        wait_opts = wait_options_increase(p, native_sel, min_count=2, timeout_ms=7000)
+        await asyncio.gather(wait_resp, wait_opts)
+        for _ in range(50):
+            try:
+                if await p.locator(f"{native_sel} >> option", has_text=option_text).count():
+                    try:
+                        await p.select_option(native_sel, label=option_text)
+                    except Exception:
+                        await p.select_option(native_sel, value=option_text)
+                    await snap(p, "after_select_division.png")
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(0.1)
+    ok = await _bootstrap_select(p, "Division Office", option_text)
+    await _dump_near(p, "Division Office", "division")
+    await snap(p, "after_select_division.png")
+    return ok
+
+async def select_nature_all(p):
+    log(f"[filter] Nature Of Application → Select all (force)")
+    js = """
+    (labelText) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(document.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes(norm(labelText)));
+      if (!L) return { ok:false, reason:'label not found' };
+      const root = L.closest('div') || L.parentElement || document.body;
+      let sel = root.querySelector('select');
+      if (!sel) {
+        sel = (L.nextElementSibling && L.nextElementSibling.matches('select')) ? L.nextElementSibling : null;
+        if (!sel) {
+          const candidates = Array.from(root.querySelectorAll('select'));
+          sel = candidates.length ? candidates[0] : null;
+        }
+      }
+      if (!sel) return { ok:false, reason:'select not found' };
+      let changed = false;
+      for (const o of sel.options) { if (!o.selected) { o.selected = true; changed = true; } }
+      if (changed) {
+        sel.dispatchEvent(new Event('input',  { bubbles:true }));
+        sel.dispatchEvent(new Event('change', { bubbles:true }));
+      }
+      return { ok:true };
+    }
+    """
+    try:
+        res = await p.evaluate(js, "Nature Of Application")
+        await snap(p, "after_select_nature.png")
+        return bool(res.get("ok"))
+    except Exception:
+        await snap(p, "fail_nature.png")
+        return False
+
+async def select_status(p, option_text: str):
+    log(f"[filter] Status → {option_text}")
+    ok, sel = await _native_select(
+        p, "Status",
+        id_candidates=["status","statusId","appStatus","applicationStatus"],
+        name_candidates=["status","statusId","appStatus","applicationStatus"],
+        option_text=option_text
+    )
+    if ok:
+        await snap(p, "after_select_status.png")
+        return True
+    js = """
+    (wanted) => {
+      const norm = s => (s||'').trim().toLowerCase();
+      const L = Array.from(document.querySelectorAll('label'))
+        .find(l => norm(l.textContent).includes('status'));
+      if (!L) return false;
+      const root = L.closest('div') || L.parentElement || document.body;
+      const sel = root.querySelector('select');
+      if (!sel) return false;
+      const w = norm(wanted);
+      let idx = -1;
+      for (let i=0;i<sel.options.length;i++){
+        const txt = norm(sel.options[i].textContent);
+        if (txt.includes(w)) { idx = i; break; }
+      }
+      if (idx === -1) return false;
+      sel.selectedIndex = idx;
+      sel.dispatchEvent(new Event('input', {bubbles:true}));
+      sel.dispatchEvent(new Event('change', {bubbles:true}));
+      return true;
+    }
+    """
+    try:
+        ok2 = await p.evaluate(js, option_text)
+        await snap(p, "after_select_status.png")
+        return bool(ok2)
+    except Exception:
+        pass
+    ok = await _bootstrap_select(p, "Status", option_text)
+    await _dump_near(p, "Status", "status")
+    await snap(p, "after_select_status.png")
+    return ok
+
+async def wait_for_report_table(p, timeout_ms=30000):
+    try:
+        await p.wait_for_selector("table, .table, .dataTable, .ag-root, #reportGrid", timeout=timeout_ms, state="visible")
+        return True
+    except Exception:
+        try:
+            await p.get_by_text("No", exact=False).wait_for(timeout=2000)
+            return True
+        except Exception:
+            return False
+
+# ---------- ensure rows after "Show Report" ----------
+async def show_report_and_wait(page):
+    await click_first(page, [
+        "button:has-text('Show Report')",
+        "input[type='button'][value='Show Report']",
+        "text=Show Report"
+    ], timeout=8000)
+    try:
+        await page.wait_for_selector("table tbody tr", state="visible", timeout=30000)
+        first_row = page.locator("table tbody tr").first
+        await first_row.wait_for(timeout=5000)
+        txt = (await first_row.inner_text()).strip()
+        if len(txt) < 5:
+            await page.wait_for_timeout(1500)
+    except Exception:
+        try:
+            await page.get_by_text("No record", exact=False).wait_for(timeout=3000)
+        except Exception:
+            raise RuntimeError("Report table did not populate with rows.")
+
+# ---------- click the red PDF icon under filters ----------
+async def click_report_pdf_icon(page):
+    candidates = [
+        "xpath=//div[contains(.,'Application Wise Report')]//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
+        "xpath=(//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]",
+        "xpath=(//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]"
+    ]
+    for sel in candidates:
+        if await page.locator(sel).count():
+            ico = page.locator(sel).first
+            await ico.scroll_into_view_if_needed()
+            await ico.click(timeout=6000, force=True)
+            return True
+    return False
+
+# ---------- fallback: print the on-page report section to PDF ----------
+async def print_report_section_pdf(page, save_path: Path):
+    # mark the report area
+    await page.evaluate("""
+      () => {
+        const byText = (t) => Array.from(document.querySelectorAll('*')).find(el => (el.textContent||'').trim().includes(t));
+        let title = byText('E-SINCHAI: APPLICATION WISE DETAILS REPORT') || byText('APPLICATION WISE DETAILS REPORT');
+        let box = title ? (title.closest('.panel, .card, .box, .container, .row') || title.parentElement) : null;
+        if (!box) {
+          // fallback to the first large table
+          box = document.querySelector('table')?.closest('.panel, .card, .box, .container, .row') || document.querySelector('table') || document.body;
+        }
+        box.id = 'reportArea';
+        const style = document.createElement('style');
+        style.textContent = `
+          * { -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }
+          @page { size: A4 landscape; margin: 10mm; }
+          @media print {
+            body * { visibility: hidden !important; }
+            #reportArea, #reportArea * { visibility: visible !important; }
+            #reportArea { position: absolute; left: 0; top: 0; width: 100%; }
+          }
+        `;
+        document.head.appendChild(style);
+      }
+    """)
+    await page.pdf(path=str(save_path), print_background=True, landscape=True)
+
+# ---------------- main flow ----------------
 async def site_login_and_download():
     login_url   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username    = os.environ["USERNAME"]
     password    = os.environ["PASSWORD"]
+    nameA       = "Delayed Apps"
+    nameB       = "Pending Apps"
     user_type   = os.getenv("USER_TYPE", "").strip()
-    stamp       = today_for_filename()
+    stamp       = today_str()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
-                "--disable-background-networking","--disable-background-timer-throttling",
-                "--disable-breakpad","--disable-client-side-phishing-detection",
-                "--disable-default-apps","--disable-hang-monitor",
-                "--disable-ipc-flooding-protection","--disable-popup-blocking",
-                "--disable-prompt-on-repost","--metrics-recording-only","--no-first-run",
-                "--safebrowsing-disable-auto-update"
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-breakpad",
+                "--disable-client-side-phishing-detection",
+                "--disable-default-apps",
+                "--disable-hang-monitor",
+                "--disable-ipc-flooding-protection",
+                "--disable-popup-blocking",
+                "--disable-prompt-on-repost",
+                "--metrics-recording-only",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
             ]
         )
         context = await browser.new_context(accept_downloads=True)
 
+        # Keep stylesheets for proper export/print; just block images & fonts
         async def speed_filter(route, request):
-            if request.resource_type in ("font",):
+            rtype = request.resource_type
+            if rtype in ("image", "font"):
                 await route.abort()
             else:
                 await route.continue_()
         await context.route("**/*", speed_filter)
 
-        context.set_default_timeout(20000)
-        context.set_default_navigation_timeout(60000)
+        context.set_default_timeout(30000)
+        context.set_default_navigation_timeout(90000)
         page = await context.new_page()
 
-        # Login
         log(f"Opening login page: {login_url}")
         last_err = None
         for _ in range(2):
             try:
                 await page.goto(login_url, wait_until="domcontentloaded"); break
-            except PWTimeout as e:
-                last_err = e
+            except PWTimeout as e: last_err = e
         if last_err: raise last_err
 
+        await snap(page, "step1_login_page.png")
+
+        selected = False
         if user_type:
+            log(f"Selecting user type: {user_type}")
             for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
                 if await page.locator(sel).count():
                     try:
-                        await page.select_option(sel, value=user_type); break
-                    except Exception:
-                        try:
-                            await page.select_option(sel, label=user_type); break
-                        except Exception:
-                            pass
+                        await page.select_option(sel, value=user_type); selected=True; break
+                    except Exception: pass
+                    try:
+                        await page.select_option(sel, label=user_type); selected=True; break
+                    except Exception: pass
+        log(f"Selected user type? {selected} (requested='{user_type}')")
+        await snap(page, "after_user_type.png")
 
-        for sel in ["#username","input[name='username']","input[placeholder*='Login']","input[placeholder*='Email']"]:
-            if await page.locator(sel).count():
-                await page.fill(sel, username); break
-        for sel in ["#password","input[name='password']","input[name='pwd']"]:
-            if await page.locator(sel).count():
-                await page.fill(sel, password); break
+        user_ok = await fill_first(page,
+            ["input[name='username']", "#username", "input[name='login']", "#login",
+             "input[name='userid']", "#userid", "#loginid", "input[name='loginid']",
+             "input[placeholder*='Email']", "input[placeholder*='Mobile']", "input[placeholder*='Login']"],
+            username)
+        pass_ok = await fill_first(page,
+            ["input[name='password']", "#password", "input[name='pwd']", "#pwd", "input[placeholder='Password']"],
+            password)
+        log(f"Filled username: {user_ok}, password: {pass_ok}")
+        await snap(page, "step2_before_login.png")
 
-        await page.locator("button:has-text('Login'), button[type='submit'], [role='button']:has-text('Login')").first.click(timeout=6000)
-        await page.wait_for_load_state("domcontentloaded")
+        clicked = await click_first(page,
+            ["button:has-text('Login')","button:has-text('Sign in')",
+             "button[type='submit']","[role='button']:has-text('Login')"],
+            timeout=5000)
+        log(f"Clicked login button? {clicked}")
+
+        await page.wait_for_load_state("domcontentloaded", timeout=60000)
+        await snap(page, "step3_after_login.png")
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
-        # Navigate → MIS Reports → Application Wise Report
-        log("[nav] Opening 'MIS Reports'…")
-        try:
-            await page.get_by_text("MIS Reports", exact=False).first.click(timeout=9000)
-        except Exception:
-            await page.locator("a:has-text('MIS Reports'), button:has-text('MIS Reports'), li:has-text('MIS Reports')").first.click(timeout=9000)
-        await asyncio.sleep(0.2)
-
-        log("[nav] Clicking 'Application Wise Report'…")
-        await page.get_by_text("Application Wise Report", exact=False).first.click(timeout=12000)
-        await page.wait_for_load_state("domcontentloaded")
-        panel = await get_app_panel(page)
-        log("[nav] Application Wise Report panel ready.")
-
-        async def run_one(status_text: str, filename: str):
-            # 1) Circle
-            if not await select_option_any(panel, page, "Circle Office", "LUDHIANA CANAL CIRCLE"):
-                await snap(page, "fail_circle.png")
-                raise RuntimeError("Could not set Circle Office (all methods)")
-
-            # 2) Division depends on Circle → wait for options to appear, then select
-            target_div = "FARIDKOT CANAL AND GROUND WATER DIVISION"
-            log("[wait] Waiting for Division list to populate after Circle…")
-            await wait_division_options_after_circle(page, target_division_text=target_div, max_wait_ms=25000)
-
-            if not await select_option_any(panel, page, "Division Office", target_div):
-                picked = await page.evaluate("""
-                  (wanted) => {
-                    const norm = s => (s||'').trim().toLowerCase();
-                    const w = norm(wanted);
-                    const selects = Array.from(document.querySelectorAll('select'));
-                    for (const sel of selects) {
-                      for (let i=0;i<sel.options.length;i++){
-                        if (norm(sel.options[i].textContent).includes(w)) {
-                          sel.selectedIndex = i;
-                          sel.dispatchEvent(new Event('input',{bubbles:true}));
-                          sel.dispatchEvent(new Event('change',{bubbles:true}));
-                          return true;
-                        }
-                      }
-                    }
-                    return false;
-                  }
-                """, target_div)
-                if picked:
-                    log(f"[filter] Division Office → {target_div} (direct any-select set after wait)")
-                else:
-                    await snap(page, "fail_division.png")
-                    raise RuntimeError("Could not set Division Office (all methods)")
-
-            # 3) Nature of Application → **Select All BEFORE Status**
-            ok_nat = await select_nature_all(panel, page)
-            log(f"[filter] Nature Of Application → Select All result: {ok_nat}")
-            if not ok_nat:
-                await snap(page, "fail_nature.png")
-                raise RuntimeError("Could not select Nature Of Application (Select All)")
-
-            # 4) Status (after Nature)
-            if not await select_option_any(panel, page, "Status", status_text):
-                await snap(page, f"fail_status_{status_text}.png")
-                raise RuntimeError(f"Could not set Status='{status_text}' (all methods)")
-
-            # 5) Dates 26/07/2024 → today + show
-            ok_rows = await set_dates_and_show(panel, settle_ms_first=5600)
-            if not ok_rows:
-                await snap(page, f"fail_rows_{status_text}.png", full=True)
-                raise RuntimeError(f"No data rows after filters+dates for status {status_text}")
-
-            await snap(page, f"after_grid_shown_{status_text.lower()}.png")
-
-            # 6) Try server PDF (download / replay). If still header-only → DOM→PDF, else screenshot last resort.
-            save_path = OUT / f"{filename} {stamp}.pdf"
-            need_dom_fallback = True
-            ok, size = await download_pdf_via_capture_and_replay(panel, save_path, settle_ms=5600)
-            if ok and size >= MIN_VALID_PDF_BYTES:
-                need_dom_fallback = False
-            else:
-                if ok:
-                    log(f"[pdf] server/replay PDF still small ({size} bytes < {MIN_VALID_PDF_BYTES}); switching to DOM→PDF.")
-                else:
-                    log("[pdf] could not obtain via replay; switching to DOM→PDF.")
-
-            if need_dom_fallback:
+        async def open_application_wise(p):
+            log("[A] Opening 'MIS Reports'…")
+            if not await click_first(p, [
+                "nav >> text=MIS Reports","text=MIS Reports","a:has-text('MIS Reports')",
+                "[role='menuitem']:has-text('MIS Reports')","button:has-text('MIS Reports')","li:has-text('MIS Reports')"
+            ], timeout=3000):
                 try:
-                    await render_panel_dom_to_pdf(panel, save_path)
-                except Exception as e:
-                    log(f"[pdf:dom] failed ({e}); using screenshot→PDF fallback.")
-                    await render_panel_via_screenshot_to_pdf(panel, save_path)
+                    await p.get_by_text("MIS Reports", exact=False).wait_for(timeout=9000)
+                    await p.get_by_text("MIS Reports", exact=False).first.click()
+                except Exception:
+                    await snap(p, "fail_find_mis_reports.png")
+                    raise RuntimeError("[A] Could not click 'MIS Reports'")
+            await p.wait_for_timeout(150)
+            await snap(p, "after_open_mis.png")
 
-            log(f"Saved {save_path.name}")
-            return str(save_path)
+            log("[A] Clicking 'Application Wise Report'…")
+            ok = await click_first(p, [
+                "text=Application Wise Report","a:has-text('Application Wise Report')",
+                "[role='menuitem']:has-text('Application Wise Report')","li:has-text('Application Wise Report')"
+            ], timeout=6000)
+            if not ok:
+                await snap(p, "fail_open_app_wise.png")
+                raise RuntimeError("[A] Could not open 'Application Wise Report'")
 
-        pathA = await run_one("DELAYED", "Delayed Apps")
-        pathB = await run_one("PENDING", "Pending Apps")
+            try:
+                await p.wait_for_url(re.compile(r".*/Authorities/applicationwisereport\.jsp.*"), timeout=20000)
+                log("[A] URL is applicationwisereport.jsp")
+            except Exception:
+                try:
+                    await p.get_by_text("Application Wise Report", exact=False).wait_for(timeout=12000)
+                except Exception:
+                    await snap(p, "fail_wait_app_wise.png")
+                    raise RuntimeError("[A] App Wise page not loaded in time")
+
+            await p.wait_for_load_state("domcontentloaded")
+            await snap(p, "after_open_app_wise.png")
+
+        async def apply_common_filters(p):
+            ok1 = await select_circle(p, "LUDHIANA CANAL CIRCLE")
+            ok2 = await select_division(p, "FARIDKOT CANAL AND GROUND WATER DIVISION")
+            ok3 = await select_nature_all(p)
+            (OUT / "dropdown_warning.txt").write_text(
+                f"Circle:{ok1} Division:{ok2} NatureAll:{ok3}\n", encoding="utf-8"
+            )
+
+        async def set_status_and_download(p, status_text: str, save_path: Path):
+            ok4 = await select_status(p, status_text)
+            log(f"[A] Status set to '{status_text}' (ok={ok4})")
+
+            log("[A] Clicking 'Show Report'…")
+            await show_report_and_wait(p)
+            await snap(p, f"after_grid_shown_{status_text.lower()}.png")
+            log(f"[A] Report grid is visible ({status_text}).")
+
+            log("[A] Looking for PDF control (red icon under filters)…")
+            async def do_pdf_click():
+                clicked = await click_report_pdf_icon(p)
+                if not clicked:
+                    raise RuntimeError("Red PDF icon not found")
+
+            ok_dl = await click_and_wait_download(p, do_pdf_click, save_path, timeout_ms=25000)
+            if not ok_dl:
+                await snap(p, f"fail_pdf_click_{status_text.lower()}.png")
+                raise RuntimeError(f"[A] Could not obtain PDF ({status_text})")
+
+            # If the server’s PDF is suspiciously small, fall back to printing the on-page report
+            try:
+                size = Path(save_path).stat().st_size
+            except Exception:
+                size = 0
+            if size < 40_000:  # heuristic: blank exports are usually tiny
+                log(f"[A] Downloaded PDF seems blank (size={size}). Using print-to-PDF fallback…")
+                await print_report_section_pdf(p, save_path)
+                log(f"[A] Fallback PDF saved → {save_path}")
+            else:
+                log(f"[A] PDF saved → {save_path}")
+
+        # === Flow ===
+        await open_application_wise(page)
+        await apply_common_filters(page)
+
+        # Report A: DELAYED
+        pathA = OUT / f"Delayed Apps {stamp}.pdf"
+        await set_status_and_download(page, "DELAYED", pathA)
+        log(f"Saved {pathA.name}")
+
+        # Report B: PENDING (toggle only Status)
+        pathB = OUT / f"Pending Apps {stamp}.pdf"
+        await set_status_and_download(page, "PENDING", pathB)
+        log(f"Saved {pathB.name}")
 
         await context.close(); await browser.close()
-        return [pathA, pathB]
-
-# ===================== TELEGRAM =====================
+    return [str(pathA), str(pathB)]
 
 async def send_via_telegram(files):
     bot = os.getenv("TELEGRAM_BOT_TOKEN"); chat = os.getenv("TELEGRAM_CHAT_ID")
@@ -920,8 +635,6 @@ async def send_via_telegram(files):
         if r.status_code != 200:
             log(f"Telegram send failed for {p}: {r.text}")
             raise RuntimeError("Telegram send failed")
-
-# ===================== ENTRY =====================
 
 async def main():
     files = await site_login_and_download()
