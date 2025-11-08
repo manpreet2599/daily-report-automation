@@ -2,223 +2,41 @@
 import os, sys, re, asyncio, traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# ----------------------------------------------------------------------------------------------------------------------
-# Paths & settings
-# ----------------------------------------------------------------------------------------------------------------------
+# =====================================================================================
+# Config & tiny helpers
+# =====================================================================================
+
 BASE = Path(__file__).resolve().parent
 OUT  = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
-IST = timezone(timedelta(hours=5, minutes=30))
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
-def today_str_ddmmyyyy():
-    return datetime.now(IST).strftime("%d/%m/%Y")
-
-def today_str_filename():
-    return datetime.now(IST).strftime("%d-%m-%Y")
-
-def log(msg: str):
+def log(msg: str) -> None:
     print(msg, flush=True)
 
-# ----------------------------------------------------------------------------------------------------------------------
-# PDF helpers
-# ----------------------------------------------------------------------------------------------------------------------
-async def html_to_pdf(context, html: str, save_path: Path, title: str):
-    """
-    Render returned HTML (server POST response) to a clean PDF using a temporary page.
-    We wrap the server HTML in a minimal container so fonts render and the table fits page width.
-    """
-    page = await context.new_page()
-    wrapper = f"""
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>{title}</title>
-        <style>
-          @page {{ size: A4; margin: 16mm; }}
-          body {{ font-family: Arial, Helvetica, sans-serif; font-size: 12px; color: #111; }}
-          .container {{ max-width: 100%; }}
-          table {{ border-collapse: collapse; width: 100%; }}
-          th, td {{ border: 1px solid #999; padding: 6px 8px; vertical-align: top; }}
-          th {{ background: #f2f2f2; }}
-          .muted {{ color: #666; font-size: 11px; margin: 0 0 8px; }}
-          .headline {{ font-size: 14px; font-weight: 700; margin-bottom: 8px; }}
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          {html}
-        </div>
-      </body>
-    </html>
-    """
-    await page.set_content(wrapper, wait_until="domcontentloaded")
-    # Let layout settle
-    await page.wait_for_timeout(400)
-    # Chromium supports PDF generation:
-    try:
-        await page.pdf(path=str(save_path), format="A4", margin={"top":"16mm","right":"16mm","bottom":"16mm","left":"16mm"})
-    except Exception:
-        # Fallback: print-to-pdf via Chromium emulate (same API)
-        await page.pdf(path=str(save_path))
-    await page.close()
-    log(f"[pdf:dom] rendered → {save_path}")
+def today_ist_ddmmyyyy() -> str:
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%d-%m-%Y")
 
-# ----------------------------------------------------------------------------------------------------------------------
-# Page navigation: ensure report form exists
-# ----------------------------------------------------------------------------------------------------------------------
-async def goto_report_page(page):
-    """
-    Ensure the 'Application Wise Report' page is actually open and has a <form>.
-    Try direct navigation first; if no <form>, use the top menu clicks as fallback.
-    """
-    # Derive site root from current URL after login
-    m = re.match(r"^(https?://[^/]+)", page.url)
-    root = m.group(1) if m else "https://esinchai.punjab.gov.in"
-    url = root + "/Authorities/applicationwisereport.jsp"
+def today_ist_slashes() -> str:
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return datetime.now(ist).strftime("%d/%m/%Y")
 
-    # 1) Try direct navigation
-    await page.goto(url, wait_until="domcontentloaded")
-    try:
-        await page.wait_for_selector("form", timeout=7000)
-        log("[nav] Application Wise Report form detected.")
-        return
-    except Exception:
-        pass
+# =====================================================================================
+# Core: robust login and navigation
+# =====================================================================================
 
-    # 2) Fallback: open via menu (MIS Reports → Application Wise Report)
-    log("[nav] Opening via menu…")
-    for sel in [
-        "nav >> text=MIS Reports",
-        "a:has-text('MIS Reports')",
-        "button:has-text('MIS Reports')",
-        "[role='menuitem']:has-text('MIS Reports')",
-        "li:has-text('MIS Reports')",
-        "text=MIS Reports"
-    ]:
-        if await page.locator(sel).first.count():
-            try:
-                await page.locator(sel).first.click(timeout=4000)
-                break
-            except Exception:
-                pass
-
-    for sel in [
-        "a:has-text('Application Wise Report')",
-        "[role='menuitem']:has-text('Application Wise Report')",
-        "li:has-text('Application Wise Report')",
-        "text=Application Wise Report"
-    ]:
-        if await page.locator(sel).first.count():
-            try:
-                await page.locator(sel).first.click(timeout=6000)
-                break
-            except Exception:
-                pass
-
-    await page.wait_for_load_state("domcontentloaded")
-    await page.wait_for_selector("form", timeout=10000)
-    log("[nav] Application Wise Report panel ready (form present).")
-
-# ----------------------------------------------------------------------------------------------------------------------
-# POST "Show Report" robustly
-# ----------------------------------------------------------------------------------------------------------------------
-async def post_show_report(page, status_text: str, from_str: str, to_str: str, tag: str):
-    """
-    Try to POST using the real report <form>. If there is no form (or it’s JS-constructed),
-    fall back to Playwright's request API with session cookies (context.request.post).
-    Saves raw HTML to out/server_{tag}.html.
-    Returns (ok, html_text).
-    """
-    # Attempt in-page fetch using the existing form and credentials
-    js = """
-    async ({statusText, fromStr, toStr}) => {
-      const form = document.querySelector("form") || document.forms[0];
-      if (!form) return { ok:false, reason: "form not found" };
-
-      const action = form.getAttribute("action") || location.pathname;
-      const fd = new FormData(form);
-
-      const trySet = (names, val) => {
-        for (const n of names) {
-          if (fd.has(n)) { fd.set(n, val); return true; }
-        }
-        if (names.length) { fd.append(names[0], val); return true; }
-        return false;
-      };
-
-      trySet(["status","statusId","appStatus","applicationStatus"], statusText);
-      trySet(["fromDate","fromdate","from_date"], fromStr);
-      trySet(["toDate","todate","to_date"], toStr);
-
-      if (!fd.has("submit") && !fd.has("show") && !fd.has("Show Report")) {
-        fd.append("submit", "Show Report");
-      }
-
-      try {
-        const resp = await fetch(action, { method:"POST", body:fd, credentials:"same-origin" });
-        const ct = resp.headers.get("content-type") || "";
-        const text = await resp.text();
-        return { ok:true, status:resp.status, ct, text };
-      } catch (e) {
-        return { ok:false, reason:String(e) };
-      }
-    }
-    """
-    res = await page.evaluate(js, {"statusText": status_text, "fromStr": from_str, "toStr": to_str})
-
-    # If the page doesn't have a form (observed in some sessions), use context.request with cookies
-    if not res or not res.get("ok"):
-        m = re.match(r"^(https?://[^/]+)", page.url)
-        root = m.group(1) if m else "https://esinchai.punjab.gov.in"
-        post_url = root + "/Authorities/applicationwisereport.jsp"
-
-        fields = {
-            "status": status_text,
-            "fromDate": from_str,
-            "toDate": to_str,
-            "submit": "Show Report"
-        }
-
-        ctx = page.context
-        resp = await ctx.request.post(post_url, form=fields)
-        text = await resp.text()
-        ct = resp.headers.get("content-type", "")
-        has_table = bool(re.search(r"<table\\b.*?<tr\\b", text, re.I | re.S))
-        log(f"[show] POST {post_url} via context.request → {resp.status} {ct}; table={has_table}")
-
-        try:
-            (OUT / f"server_{tag}.html").write_text(text, encoding="utf-8")
-        except Exception:
-            pass
-
-        return True, text
-
-    # Normal in-page path
-    text = res.get("text") or ""
-    ct   = (res.get("ct") or "").lower()
-    status_code = res.get("status")
-    has_table = bool(re.search(r"<table\\b.*?<tr\\b", text, re.I | re.S))
-    log(f"[show] POST /Authorities/applicationwisereport.jsp → {status_code} {ct}; table={has_table}")
-
-    try:
-        (OUT / f"server_{tag}.html").write_text(text, encoding="utf-8")
-    except Exception:
-        pass
-
-    return True, text
-
-# ----------------------------------------------------------------------------------------------------------------------
-# Login
-# ----------------------------------------------------------------------------------------------------------------------
 async def login(context, login_url: str, username: str, password: str):
     page = await context.new_page()
     log(f"Opening login page: {login_url}")
+
     last_err = None
     for _ in range(2):
         try:
@@ -229,38 +47,52 @@ async def login(context, login_url: str, username: str, password: str):
     if last_err:
         raise last_err
 
-    # Fill username/password using robust candidates
-    u_cands = ["#username", "input[name='username']", "#loginid", "input[name='loginid']", "input[placeholder*='Login']"]
-    p_cands = ["#password", "input[name='password']", "#pwd", "input[name='pwd']"]
+    # Already logged in?
+    if "/Authorities/" in page.url:
+        log("Login complete (session cookie).")
+        log(f"Current URL: {page.url}")
+        return page
 
-    filled_u = False
-    for sel in u_cands:
+    # Pick user type if present (XEN per your usage)
+    for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
+        if await page.locator(sel).first.count():
+            try:
+                await page.select_option(sel, value="XEN")
+                break
+            except Exception:
+                try:
+                    await page.select_option(sel, label="XEN")
+                    break
+                except Exception:
+                    pass
+
+    # Fill username
+    u_ok = False
+    for sel in ["#username","input[name='username']","#loginid","input[name='loginid']",
+                "input[placeholder*='Login' i]","input[placeholder*='Email' i]","input[placeholder*='Mobile' i]"]:
         if await page.locator(sel).first.count():
             try:
                 await page.fill(sel, username, timeout=7000)
-                filled_u = True
+                u_ok = True
                 break
             except Exception:
                 pass
 
-    filled_p = False
-    for sel in p_cands:
+    # Fill password
+    p_ok = False
+    for sel in ["#password","input[name='password']","#pwd","input[name='pwd']","input[placeholder='Password']"]:
         if await page.locator(sel).first.count():
             try:
                 await page.fill(sel, password, timeout=7000)
-                filled_p = True
+                p_ok = True
                 break
             except Exception:
                 pass
 
-    # Click login button
+    # Click login
     clicked = False
-    for sel in [
-        "button:has-text('Login')",
-        "button:has-text('Sign in')",
-        "button[type='submit']",
-        "[role='button']:has-text('Login')"
-    ]:
+    for sel in ["button:has-text('Login')","button:has-text('Sign in')","button[type='submit']",
+                "[role='button']:has-text('Login')","input[type='submit'][value*='Login']"]:
         if await page.locator(sel).first.count():
             try:
                 await page.locator(sel).first.click(timeout=5000)
@@ -269,48 +101,360 @@ async def login(context, login_url: str, username: str, password: str):
             except Exception:
                 pass
 
-    # Wait for dashboard
-    await page.wait_for_load_state("domcontentloaded")
+    if not clicked and p_ok:
+        try:
+            await page.keyboard.press("Enter")
+        except Exception:
+            pass
+
+    try:
+        await page.wait_for_load_state("domcontentloaded", timeout=20000)
+    except Exception:
+        pass
+
+    def looks_like_dashboard(u: str, html: str) -> bool:
+        return ("/Authorities/" in u) or ("Authorities Dashboard" in html) or ("MIS Reports" in html)
+
+    html = await page.content()
+    if not looks_like_dashboard(page.url, html):
+        try:
+            await page.wait_for_timeout(1500)
+            html = await page.content()
+        except Exception:
+            pass
+
+    if not looks_like_dashboard(page.url, html):
+        log(f"[login] Still at {page.url}. Page did not transition to dashboard.")
+        raise RuntimeError("Login did not reach dashboard.")
+
     log("Login complete.")
     log(f"Current URL: {page.url}")
     return page
 
-# ----------------------------------------------------------------------------------------------------------------------
-# One report flow
-# ----------------------------------------------------------------------------------------------------------------------
-async def run_one(context, page, status_text: str, nice_name: str, from_str: str, to_str: str):
-    # Ensure report page is ready
+
+async def goto_report_page(page):
+    """
+    Navigate directly to /Authorities/applicationwisereport.jsp.
+    Consider ready when we see Show Report button, Status label or the heading.
+    """
+    async def ensure_not_logged_out():
+        if "signup.jsp" in page.url:
+            raise RuntimeError("Session bounced to signup.jsp; need to re-login.")
+
+    m = re.match(r"^(https?://[^/]+)", page.url or "")
+    root = m.group(1) if m else "https://esinchai.punjab.gov.in"
+
+    if "/Authorities/" not in page.url:
+        await page.goto(root + "/Authorities/authoritiesdashboard.jsp", wait_until="domcontentloaded")
+
+    await ensure_not_logged_out()
+
+    target = root + "/Authorities/applicationwisereport.jsp"
+    await page.goto(target, wait_until="domcontentloaded")
+
+    ready_sels = [
+        "button:has-text('Show Report')",
+        "input[type='button'][value='Show Report']",
+        "label:has-text('Status')",
+        "text=Application Wise Report"
+    ]
+    for _ in range(2):
+        for sel in ready_sels:
+            if await page.locator(sel).first.count():
+                log("[nav] Application Wise Report panel ready.")
+                return
+        await page.wait_for_timeout(500)
+        await ensure_not_logged_out()
+
+    # menu fallback
+    log("[nav] Opening via menu…")
+    for sel in ["nav >> text=MIS Reports","a:has-text('MIS Reports')","button:has-text('MIS Reports')",
+                "[role='menuitem']:has-text('MIS Reports')","li:has-text('MIS Reports')","text=MIS Reports"]:
+        if await page.locator(sel).first.count():
+            try:
+                await page.locator(sel).first.click(timeout=4000)
+                break
+            except Exception:
+                pass
+
+    for sel in ["a:has-text('Application Wise Report')","[role='menuitem']:has-text('Application Wise Report')",
+                "li:has-text('Application Wise Report')","text=Application Wise Report"]:
+        if await page.locator(sel).first.count():
+            try:
+                await page.locator(sel).first.click(timeout=6000)
+                break
+            except Exception:
+                pass
+
+    await page.wait_for_load_state("domcontentloaded")
+    await ensure_not_logged_out()
+
+    for sel in ready_sels:
+        if await page.locator(sel).first.count():
+            log("[nav] Application Wise Report panel ready (menu path).")
+            return
+
+    raise RuntimeError("Could not detect the Application Wise Report panel (no Show Report/Status/heading).")
+
+# =====================================================================================
+# Filters (robust JS helpers)
+# =====================================================================================
+
+SET_SELECT_BY_LABEL_JS = """
+(labelText, wanted, exact) => {
+  const norm = s => (s||'').trim().toLowerCase();
+  const L = Array.from(document.querySelectorAll('label'))
+    .find(l => norm(l.textContent).includes(norm(labelText)));
+  const findSelect = (root) => {
+    if (!root) return null;
+    // priority: sibling select, then nearest select in container
+    let s = L && L.nextElementSibling && L.nextElementSibling.matches('select') ? L.nextElementSibling : null;
+    if (!s) {
+      const cands = Array.from((root.closest('div')||root).querySelectorAll('select'));
+      s = cands.length ? cands[0] : null;
+    }
+    return s;
+  };
+  const sel = findSelect(L || document.body);
+  if (!sel) return {ok:false, reason:'select not found'};
+  const W = norm(wanted);
+  let idx = -1;
+  for (let i=0;i<sel.options.length;i++){
+    const txt = norm(sel.options[i].textContent);
+    if (exact ? (txt === W) : txt.includes(W)) { idx = i; break; }
+  }
+  if (idx === -1) return {ok:false, reason:'option not found'};
+  if (sel.selectedIndex !== idx){
+    sel.selectedIndex = idx;
+    sel.dispatchEvent(new Event('input',{bubbles:true}));
+    sel.dispatchEvent(new Event('change',{bubbles:true}));
+  }
+  return {ok:true};
+}
+"""
+
+SELECT_ALL_IN_MULTI_JS = """
+(labelText) => {
+  const norm = s => (s||'').trim().toLowerCase();
+  const L = Array.from(document.querySelectorAll('label'))
+    .find(l => norm(l.textContent).includes(norm(labelText)));
+  if (!L) return {ok:false, reason:'label not found'};
+  const findSelect = (root) => {
+    let s = L && L.nextElementSibling && L.nextElementSibling.matches('select') ? L.nextElementSibling : null;
+    if (!s) {
+      const cands = Array.from((root.closest('div')||root).querySelectorAll('select'));
+      s = cands.length ? cands[0] : null;
+    }
+    return s;
+  };
+  const sel = findSelect(L || document.body);
+  if (!sel) return {ok:false, reason:'select not found'};
+  let changed = false;
+  for (const o of sel.options) {
+    if (!o.selected) { o.selected = true; changed = true; }
+  }
+  if (changed) {
+    sel.dispatchEvent(new Event('input',{bubbles:true}));
+    sel.dispatchEvent(new Event('change',{bubbles:true}));
+  }
+  const chosen = Array.from(sel.selectedOptions).map(o=>o.textContent.trim());
+  return {ok:true, chosen};
+}
+"""
+
+SET_INPUT_BY_LABEL_JS = """
+(labelText, value) => {
+  const norm = s => (s||'').trim().toLowerCase();
+  const L = Array.from(document.querySelectorAll('label'))
+    .find(l => norm(l.textContent).includes(norm(labelText)));
+  if (!L) return {ok:false, reason:'label not found'};
+  const root = L.closest('div') || L.parentElement || document.body;
+  let inp = root.querySelector('input');
+  if (!inp && L.nextElementSibling && L.nextElementSibling.matches('input')) {
+    inp = L.nextElementSibling;
+  }
+  if (!inp) return {ok:false, reason:'input not found'};
+  inp.value = value;
+  inp.dispatchEvent(new Event('input',{bubbles:true}));
+  inp.dispatchEvent(new Event('change',{bubbles:true}));
+  return {ok:true, value:inp.value};
+}
+"""
+
+async def set_dropdown_by_label(page, label_text: str, value_text: str, exact=True) -> bool:
+    try:
+        res = await page.evaluate(SET_SELECT_BY_LABEL_JS, label_text, value_text, bool(exact))
+        ok = bool(res.get("ok"))
+        if not ok and DEBUG:
+            log(f"[filter] {label_text} failed: {res}")
+        return ok
+    except Exception:
+        return False
+
+async def select_all_multiselect(page, label_text: str) -> bool:
+    try:
+        res = await page.evaluate(SELECT_ALL_IN_MULTI_JS, label_text)
+        ok = bool(res.get("ok"))
+        if ok:
+            chosen = res.get("chosen", [])
+            log(f"[filter] {label_text} → Select All: {chosen if chosen else 'OK'}")
+        return ok
+    except Exception:
+        return False
+
+async def set_input_date(page, label_text: str, value_ddmmyyyy: str) -> bool:
+    try:
+        res = await page.evaluate(SET_INPUT_BY_LABEL_JS, label_text, value_ddmmyyyy)
+        return bool(res.get("ok"))
+    except Exception:
+        return False
+
+# =====================================================================================
+# Show Report + capture POST HTML, then render DOM to PDF
+# =====================================================================================
+
+def has_table(html: str) -> bool:
+    # very relaxed check
+    return "<table" in html.lower() and "</table>" in html.lower()
+
+async def click_show_report_and_capture(page) -> Optional[str]:
+    """
+    Clicks Show Report on the page and captures the POST HTML response
+    from /Authorities/applicationwisereport.jsp. Returns HTML text or None.
+    """
+    # prepare waiter
+    def _match(resp):
+        try:
+            return (resp.request.method == "POST") and ("/Authorities/applicationwisereport.jsp" in resp.url)
+        except Exception:
+            return False
+
+    waiter = page.wait_for_response(_match, timeout=30000)
+
+    # click Show Report
+    clicked = False
+    for sel in ["button:has-text('Show Report')","input[type='button'][value='Show Report']","text=Show Report"]:
+        if await page.locator(sel).first.count():
+            try:
+                await page.locator(sel).first.click(timeout=8000)
+                clicked = True
+                break
+            except Exception:
+                pass
+    if not clicked:
+        raise RuntimeError("Show Report button not found")
+
+    # await response
+    try:
+        resp = await waiter
+        body = await resp.text()
+        ctype = resp.headers.get("content-type","").lower()
+        ok = ("text/html" in ctype) and has_table(body)
+        log(f"[show] POST /Authorities/applicationwisereport.jsp → {resp.status} {ctype}; table={ok}")
+        return body if ok else None
+    except Exception:
+        log("[show] POST capture failed or timed out.")
+        return None
+
+async def render_html_to_pdf(context, html: str, save_path: Path) -> None:
+    """
+    Spins up a fresh page, injects the server HTML into a minimal printable wrapper,
+    and prints to PDF.
+    """
+    page = await context.new_page()
+    # Basic wrapper to ensure fonts/backgrounds render
+    wrapped = f"""
+<!doctype html><html>
+<head>
+<meta charset="utf-8">
+<title>Report</title>
+<style>
+  body {{ font-family: Arial, Helvetica, sans-serif; margin: 12px; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #444; padding: 4px; font-size: 12px; }}
+  thead th {{ background: #eee; }}
+  .meta {{ margin-bottom: 10px; font-size: 12px; color: #333; }}
+</style>
+</head>
+<body>
+<div class="meta">Rendered from server HTML on {today_ist_ddmmyyyy()}</div>
+<div id="report-root">{html}</div>
+</body>
+</html>
+    """.strip()
+
+    await page.set_content(wrapped, wait_until="load")
+    # give dynamic images/fonts a brief chance (safe even if none)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=5000)
+    except Exception:
+        pass
+
+    pdf_bytes = await page.pdf(print_background=True)
+    Path(save_path).write_bytes(pdf_bytes)
+    await page.close()
+    log(f"[pdf:dom] rendered → {save_path}")
+
+# =====================================================================================
+# One run: set filters, dates, show, capture, render
+# =====================================================================================
+
+async def run_one(context, page, status_text: str, name_prefix: str, from_str: str, to_str: str) -> str:
+    # Navigate to report page (idempotent)
     await goto_report_page(page)
 
-    tag = "delayed" if status_text.upper().startswith("DELAY") else "pending"
+    # Filters: Circle, Division, Nature(all), Status
+    ok_c = await set_dropdown_by_label(page, "Circle Office", "LUDHIANA CANAL CIRCLE", exact=True)
+    if not ok_c:
+        log("[filter] Circle Office could not be set (will proceed anyway).")
 
-    ok, html = await post_show_report(page, status_text, from_str, to_str, tag)
-    if not ok or not html:
-        raise RuntimeError(f"Show Report POST failed for {status_text}")
+    # Division list may load after Circle; give it a short moment
+    await page.wait_for_timeout(700)
+    ok_d = await set_dropdown_by_label(page, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION", exact=True)
+    if not ok_d:
+        log("[filter] Division Office could not be set (will proceed anyway).")
 
-    # Quick sanity check — in cases we *also* click site’s PDF, it often returns tiny/blank files.
-    # We bypass that path and render the server HTML (which contains the table) to a clean PDF.
-    fname = f"{nice_name} {today_str_filename()}.pdf"
-    save_path = OUT / fname
+    # Nature of Application: select all
+    ok_n = await select_all_multiselect(page, "Nature Of Application")
+    if not ok_n:
+        log("[filter] Nature Of Application select-all failed (will proceed anyway).")
 
-    # If for some reason the returned HTML doesn’t contain a table, we still render the whole response,
-    # so you can inspect the PDF and the saved server_{tag}.html.
-    has_table = bool(re.search(r"<table\\b.*?<tr\\b", html, re.I | re.S))
-    if not has_table:
-        log("[warn] Returned HTML does not contain a table; rendering whole page for inspection.")
+    # Status
+    ok_s = await set_dropdown_by_label(page, "Status", status_text, exact=False)
+    if not ok_s:
+        log(f"[filter] Status '{status_text}' could not be set (will proceed anyway).")
 
-    await html_to_pdf(context, html, save_path, title=f"{nice_name} ({from_str} → {to_str})")
-    log(f"Saved {fname}")
+    # Dates (dd/mm/yyyy)
+    ok_from = await set_input_date(page, "From Date", from_str)
+    ok_to   = await set_input_date(page, "To Date", to_str)
+    if not ok_from or not ok_to:
+        log(f"[dates] Warning: failed to set one or both dates (From='{from_str}', To='{to_str}'). Proceeding.")
+
+    # Click Show Report and capture server POST HTML
+    html = await click_show_report_and_capture(page)
+    if not html:
+        log("[warn] Direct server PDF still small/blank or POST HTML not usable. Falling back to DOM render from current page HTML.")
+        # take current page HTML as last resort
+        try:
+            html = await page.content()
+        except Exception:
+            html = "<div>No content captured</div>"
+
+    # Render to PDF
+    stamp = today_ist_ddmmyyyy()
+    save_path = OUT / f"{name_prefix} {stamp}.pdf"
+    await render_html_to_pdf(context, html, save_path)
+    log(f"Saved {save_path.name}")
     return str(save_path)
 
-# ----------------------------------------------------------------------------------------------------------------------
+# =====================================================================================
 # Telegram
-# ----------------------------------------------------------------------------------------------------------------------
+# =====================================================================================
+
 async def send_via_telegram(files):
     bot = os.getenv("TELEGRAM_BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
     if not bot or not chat:
-        log("[tg] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping Telegram delivery.")
         return
     import requests
     for p in files:
@@ -323,51 +467,33 @@ async def send_via_telegram(files):
         if r.status_code == 200:
             log(f"[tg] sent {Path(p).name}")
         else:
-            log(f"[tg] failed for {p}: {r.text}")
+            log(f"[tg] failed {Path(p).name}: {r.text}")
 
-# ----------------------------------------------------------------------------------------------------------------------
-# Main
-# ----------------------------------------------------------------------------------------------------------------------
+# =====================================================================================
+# Entry
+# =====================================================================================
+
 async def site_login_and_download():
     login_url = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username  = os.environ["USERNAME"]
     password  = os.environ["PASSWORD"]
 
-    # Dates: 26/07/2024 → today (IST)
+    # Date range per your instruction
     from_str = "26/07/2024"
-    to_str   = today_str_ddmmyyyy()
+    to_str   = today_ist_slashes()  # dd/mm/yyyy
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
             args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-breakpad",
-                "--disable-client-side-phishing-detection",
-                "--disable-default-apps",
-                "--disable-hang-monitor",
-                "--disable-ipc-flooding-protection",
-                "--disable-popup-blocking",
-                "--disable-prompt-on-repost",
-                "--metrics-recording-only",
-                "--no-first-run",
-                "--safebrowsing-disable-auto-update",
-            ]
+                "--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
+                "--disable-background-networking","--disable-background-timer-throttling",
+                "--disable-breakpad","--disable-client-side-phishing-detection",
+                "--disable-default-apps","--disable-hang-monitor","--disable-popup-blocking",
+                "--metrics-recording-only","--no-first-run","--safebrowsing-disable-auto-update"
+            ],
         )
         context = await browser.new_context(accept_downloads=True)
-
-        # Don't block CSS/images; some sites need them for layout. We can still block fonts.
-        async def speed_filter(route, request):
-            if request.resource_type == "font":
-                await route.abort()
-            else:
-                await route.continue_()
-        await context.route("**/*", speed_filter)
-
         context.set_default_timeout(30000)
         context.set_default_navigation_timeout(90000)
 
@@ -376,9 +502,9 @@ async def site_login_and_download():
         delayed_path = await run_one(context, page, "DELAYED", "Delayed Apps", from_str, to_str)
         pending_path = await run_one(context, page, "PENDING", "Pending Apps", from_str, to_str)
 
-        await context.close(); await browser.close()
-
-    return [delayed_path, pending_path]
+        await context.close()
+        await browser.close()
+        return [delayed_path, pending_path]
 
 async def main():
     files = await site_login_and_download()
