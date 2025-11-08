@@ -12,15 +12,15 @@ OUT = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
 IST = timezone(timedelta(hours=5, minutes=30))
-MIN_VALID_PDF_BYTES = 50000
+MIN_VALID_PDF_BYTES = 50000  # header-only PDFs are ~29–30 KB in your logs
 
 def log(m): print(m, flush=True)
 def today_ist(): return datetime.now(IST)
 def today_ddmmyyyy(): return today_ist().strftime("%d/%m/%Y")
 def today_fname(): return today_ist().strftime("%d-%m-%Y")
-
 async def wait_ms(ms): await asyncio.sleep(ms/1000.0)
 
+# ====================== DATA CHECKS ======================
 async def panel_has_data(panel) -> bool:
     try:
         return await panel.evaluate("""(root)=>{
@@ -33,20 +33,18 @@ async def panel_has_data(panel) -> bool:
             if (tds.length>=2 && tds.some(Boolean)) return true;
           }
           const txt=(tb.innerText||'').toLowerCase();
-          if (txt.includes('no data available')) return false;
-          return false;
+          return !txt.includes('no data available');
         }""")
     except Exception:
         return False
 
-# ---------- Robust dropdown setter: selectpicker/multiselect/native + direct UI clicking ----------
+# ====================== SELECT HANDLERS ======================
 SET_SELECT_VALUES = r"""
 (root, cfg) => {
   const { candidates, values, selectAll, exact } = cfg;
   const norm = s => (s||'').trim();
   const lower = s => norm(s).toLowerCase();
 
-  // resolve the hidden/native <select>
   let el = null;
   for (const q of candidates) {
     const e = root.querySelector(q) || document.querySelector(q);
@@ -61,7 +59,6 @@ SET_SELECT_VALUES = r"""
 
   const pickTexts = Array.isArray(values) ? values : [];
   const want = pickTexts.map(v => exact ? norm(v) : lower(v));
-
   const allOpts = Array.from(el.options || []).map(o => ({
     text: norm(o.textContent||o.label||''),
     value: o.value
@@ -77,148 +74,106 @@ SET_SELECT_VALUES = r"""
     return picked;
   };
 
-  const readDisplayText = () => {
-    // read the selectpicker button label if present
+  // set underlying <select> (works for native/multiselect; selectpicker reads it too)
+  try {
+    const vals = matchValues();
+    const setAll = new Set(vals);
+    if (isMultiSelect) {
+      const $el = window.jQuery(el);
+      try { $el.multiselect('deselectAll', false); } catch(e){}
+      if (selectAll) { try { $el.multiselect('selectAll', false); } catch(e){} }
+      else { try { $el.multiselect('select', vals); } catch(e){} }
+      try { $el.multiselect('refresh'); } catch(e){}
+      try { $el.multiselect('updateButtonText'); } catch(e){}
+    } else {
+      if (el.multiple) {
+        for (const o of el.options) o.selected = selectAll ? true : setAll.has(o.value);
+      } else {
+        for (const o of el.options) o.selected = false;
+        if (vals[0] != null) {
+          const v = vals[0];
+          const targ = Array.from(el.options).find(o => o.value === v);
+          if (targ) targ.selected = true;
+        }
+      }
+    }
+    el.dispatchEvent(new Event('input',{bubbles:true}));
+    el.dispatchEvent(new Event('change',{bubbles:true}));
+  } catch(e) {}
+
+  // prefer selectpicker button label for readback
+  const readLabel = () => {
     let box = null;
     if (el.id) box = document.querySelector(`.bootstrap-select[data-id="${el.id}"]`);
     if (!box) box = el.closest('.bootstrap-select');
     if (box) {
       const inner = box.querySelector('.filter-option-inner-inner, .filter-option-inner');
-      if (inner) return norm(inner.textContent||'');
+      if (inner) {
+        const t=(inner.textContent||'').trim();
+        if (t) return [t];
+      }
     }
-    // fallback to selected options
-    const selected = Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
-    return selected.join(', ');
+    return Array.from(el.selectedOptions||[]).map(o=>(o.textContent||o.label||o.value||'').trim()).filter(Boolean);
   };
 
-  const clickUIAndPick = () => {
-    // drive the visible dropdown directly
-    let box = null;
-    if (el.id) box = document.querySelector(`.bootstrap-select[data-id="${el.id}"]`);
-    if (!box) box = el.closest('.bootstrap-select');
-    if (!box) return false;
-    const btn = box.querySelector('button.dropdown-toggle');
-    if (!btn) return false;
-
-    // open
-    btn.click();
-    const menu = document.querySelector('.dropdown-menu.show') || box.querySelector('.dropdown-menu');
-    if (!menu) { try{btn.click();}catch(e){} return false; }
-
-    const itemNodes = Array.from(menu.querySelectorAll('li:not(.disabled) a, li:not(.disabled) .text, .dropdown-item'))
-      .filter(n => norm(n.textContent||''));
-    if (itemNodes.length === 0) { try{document.body.click();}catch(e){} return false; }
-
-    const chooseOne = (needle) => {
-      const w = exact ? norm(needle) : lower(needle);
-      const found = itemNodes.find(n => {
-        const t = norm(n.textContent||'');
-        return exact ? (t === w) : lower(t).includes(w);
-      });
-      if (found) {
-        (found.closest('a') || found).click();
-        return true;
-      }
-      return false;
-    };
-
-    if (selectAll) {
-      // click all visible options (except "None selected")
-      for (const n of itemNodes) {
-        const t = norm(n.textContent||'');
-        if (t && lower(t) !== 'none selected') {
-          (n.closest('a') || n).click();
-        }
-      }
-    } else {
-      for (const t of pickTexts) chooseOne(t);
-    }
-
-    // close
-    try { document.body.click(); } catch(e) {}
-    try { btn.blur(); } catch(e) {}
-    try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
-
-    return true;
-  };
-
-  try {
-    // 1) If selectpicker UI exists, prefer clicking the visible menu
-    let usedUI = false;
-    if (isSelectPicker) {
-      usedUI = clickUIAndPick();
-      // try to refresh plugin if available
-      try {
-        if (hasJQ && typeof window.jQuery(el).selectpicker === 'function') {
-          const $el = window.jQuery(el);
-          try{$el.selectpicker('render');}catch(e){}
-          try{$el.selectpicker('refresh');}catch(e){}
-        }
-      } catch(e){}
-    }
-
-    // 2) If UI path failed or this isn't selectpicker, set underlying <select>
-    if (!usedUI) {
-      const vals = matchValues();
-      const setAll = new Set(vals);
-      if (isMultiSelect) {
-        const $el = window.jQuery(el);
-        try { $el.multiselect('deselectAll', false); } catch(e){}
-        if (selectAll) {
-          try { $el.multiselect('selectAll', false); } catch(e){}
-        } else {
-          try { $el.multiselect('select', vals); } catch(e){}
-        }
-        try { $el.multiselect('refresh'); } catch(e){}
-        try { $el.multiselect('updateButtonText'); } catch(e){}
-      } else {
-        if (el.multiple) {
-          for (const o of el.options) o.selected = selectAll ? true : setAll.has(o.value);
-        } else {
-          for (const o of el.options) o.selected = false;
-          if (vals[0] != null) {
-            const v = vals[0];
-            const targ = Array.from(el.options).find(o => o.value === v);
-            if (targ) targ.selected = true;
-          }
-        }
-      }
-      el.dispatchEvent(new Event('input',{bubbles:true}));
-      el.dispatchEvent(new Event('change',{bubbles:true}));
-    }
-  } catch(e) {}
-
-  // final readback
-  const labelText = readDisplayText();
-  const selected = labelText ? [labelText] : Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
-  const ok = selected.length>0 && selected[0].toLowerCase() !== 'none selected';
+  const selected = readLabel();
+  const ok = selected.length>0 and selected[0].toLowerCase() != 'none selected';
   return {ok, selected};
 }
 """
 
-READ_SELECTED = r"""
-(root, candidates) => {
-  const norm = s => (s||'').trim();
-  let el = null;
-  for (const q of candidates) {
-    const e = root.querySelector(q) || document.querySelector(q);
-    if (e) { el = e; break; }
-  }
-  if (!el) return [];
-  // prefer button label if selectpicker
-  let box = null;
-  if (el.id) box = document.querySelector(`.bootstrap-select[data-id="${el.id}"]`);
-  if (!box) box = el.closest('.bootstrap-select');
-  if (box) {
-    const inner = box.querySelector('.filter-option-inner-inner, .filter-option-inner');
-    if (inner) {
-      const txt = norm(inner.textContent||'');
-      if (txt) return [txt];
-    }
-  }
-  return Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
-}
-"""
+# === NEW: click the visible Bootstrap-select like a human ===
+async def _find_bs_toggle_by_label(panel, label_text: str):
+    return await panel.evaluate_handle("""(root, lbl)=>{
+      const norm=s=>(s||'').trim().toLowerCase();
+      // find the label by text
+      const L=[...root.querySelectorAll('label')].find(l=>norm(l.textContent).includes(norm(lbl)));
+      let btn=null;
+      if(L){
+        let scope = L.closest('.form-group') || L.parentElement || root;
+        btn = scope.querySelector('.bootstrap-select button.dropdown-toggle');
+      }
+      if(!btn){
+        // fallback: first bootstrap-select inside the panel
+        btn = root.querySelector('.bootstrap-select button.dropdown-toggle');
+      }
+      return btn || null;
+    }""", label_text)
+
+async def selectpicker_by_label(panel, label_text: str, option_text: str, exact: bool=True, timeout_ms: int=12000) -> bool:
+    btn_handle = await _find_bs_toggle_by_label(panel, label_text)
+    if btn_handle is None:
+        return False
+    page = panel.page
+    try:
+        # open menu
+        await page.evaluate("(btn)=>btn.click()", btn_handle)
+        menu = page.locator(".dropdown-menu.show").first
+        await menu.wait_for(timeout=timeout_ms)
+
+        # try search box if present
+        sb = menu.locator(".bs-searchbox input").first
+        if await sb.count():
+            await sb.fill(option_text)
+            await sb.press("Enter")
+        else:
+            candidate = menu.locator("li:not(.disabled) a, li:not(.disabled) .text, .dropdown-item").filter(has_text=option_text).first
+            await candidate.scroll_into_view_if_needed()
+            await candidate.click(timeout=timeout_ms)
+
+        # close & verify
+        await page.mouse.click(1, 1)
+        label = await page.evaluate("""(btn)=>{
+            const norm=s=>(s||'').trim();
+            const inner = btn.querySelector('.filter-option-inner-inner, .filter-option-inner');
+            return inner ? norm(inner.textContent||'') : norm(btn.textContent||'');
+        }""", btn_handle)
+        if not label or label.lower() == "none selected":
+            return False
+        return (option_text.strip() == label.strip()) if exact else (option_text.strip().lower() in label.strip().lower())
+    finally:
+        try: await btn_handle.dispose()
+        except: pass
 
 async def set_dropdown(panel, candidates, *, values=None, select_all=False, exact=False, label=""):
     res = await panel.evaluate(SET_SELECT_VALUES, {
@@ -232,7 +187,7 @@ async def set_dropdown(panel, candidates, *, values=None, select_all=False, exac
     log(f"[filter] {label or candidates[0]} → {picked if picked else 'None'} (ok={ok})")
     return ok
 
-# -------- site hooks / waits ----------
+# site hook to populate divisions after circle
 CALL_DIVISION_LIST = r"""(root)=>{ try{ if(typeof window.DivisionList==='function') window.DivisionList(); }catch(e){} return true; }"""
 
 async def wait_division_option_text(page, candidates, division_text, timeout_ms=25000):
@@ -260,7 +215,7 @@ async def wait_division_option_text(page, candidates, division_text, timeout_ms=
         await wait_ms(250)
     return False
 
-# -------- dates + show --------
+# ====================== DATES & SHOW ======================
 FILL_DATES_JS = r"""
 (root, cfg) => {
   const { fromDDMMYYYY, toDDMMYYYY } = cfg;
@@ -302,7 +257,7 @@ async def click_show_report(panel):
       if(!btn) return false; btn.click(); return true;
     }""")
 
-# -------- PDF helpers --------
+# ====================== PDF HELPERS ======================
 async def click_pdf_icon(panel):
     for sel in [
         "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
@@ -392,7 +347,7 @@ async def render_dom_table_pdf(panel, pdf_path: Path):
     await tmp.close()
     log(f"[pdf:dom] table-only → {pdf_path}")
 
-# ---------- login helpers ----------
+# ====================== LOGIN HELPERS ======================
 USERNAME_CANDS = [
     "#username", "input#username",
     "input[name='username']", "input[name='loginid']", "input[name='userid']", "input[name='login']",
@@ -444,7 +399,7 @@ async def wait_for_any_selector(page, cands, timeout_ms=30000) -> bool:
         await wait_ms(200)
     return False
 
-# ---------- main flow ----------
+# ====================== MAIN FLOW ======================
 async def site_login_and_download():
     login_url = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username  = os.environ["USERNAME"]
@@ -458,7 +413,7 @@ async def site_login_and_download():
         )
         context = await browser.new_context(accept_downloads=True)
 
-        # Only block fonts; keep CSS/JS/images so widgets render.
+        # Keep CSS/JS/images; block only fonts
         async def speed_filter(route, request):
             if request.resource_type in ("font",):
                 await route.abort()
@@ -512,20 +467,28 @@ async def site_login_and_download():
                 raise RuntimeError("PDF icon not found")
 
         async def run_one(status_text: str, base_name: str):
-            # Circle
-            ok = await set_dropdown(panel, circle_cands, values=["LUDHIANA CANAL CIRCLE"], exact=True, label="Circle Office")
-            if not ok: raise RuntimeError("Circle Office selection failed")
+            # Circle (UI clicker first, then fallback)
+            ok = await selectpicker_by_label(panel, "Circle Office", "LUDHIANA CANAL CIRCLE", exact=True)
+            log(f"[filter] Circle Office (UI clicker) → {'ok' if ok else 'FAILED'}")
+            if not ok:
+                ok = await set_dropdown(panel, circle_cands, values=["LUDHIANA CANAL CIRCLE"], exact=True, label="Circle Office (fallback)")
+            if not ok:
+                raise RuntimeError("Circle Office selection failed")
 
             # Division list often loads after circle
             try: await panel.evaluate(CALL_DIVISION_LIST)
             except Exception: pass
             await wait_division_option_text(page, division_cands, "FARIDKOT CANAL AND GROUND WATER DIVISION", timeout_ms=25000)
 
-            # Division
-            ok = await set_dropdown(panel, division_cands, values=["FARIDKOT CANAL AND GROUND WATER DIVISION"], exact=True, label="Division Office")
-            if not ok: raise RuntimeError("Division Office selection failed")
+            # Division (UI clicker first, then fallback)
+            ok = await selectpicker_by_label(panel, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION", exact=True)
+            log(f"[filter] Division Office (UI clicker) → {'ok' if ok else 'FAILED'}")
+            if not ok:
+                ok = await set_dropdown(panel, division_cands, values=["FARIDKOT CANAL AND GROUND WATER DIVISION"], exact=True, label="Division Office (fallback)")
+            if not ok:
+                raise RuntimeError("Division Office selection failed")
 
-            # Nature → All (before Status)
+            # Nature → All (must be before Status)
             ok = await set_dropdown(panel, nature_cands, select_all=True, label="Nature Of Application (Select All)")
             if not ok: raise RuntimeError("Nature selection failed")
 
@@ -542,7 +505,7 @@ async def site_login_and_download():
             if not await click_show_report(panel):
                 raise RuntimeError("Show Report button not found")
 
-            # wait rows
+            # wait for rows
             for _ in range(40):
                 if await panel_has_data(panel): break
                 await wait_ms(250)
@@ -551,7 +514,7 @@ async def site_login_and_download():
 
             save_path = OUT / f"{base_name} {today_fname()}.pdf"
 
-            # try native server PDF
+            # try server PDF
             got = await click_and_wait_download(page, lambda: click_pdf_icon_or_fail(panel), save_path, timeout_ms=35000)
             size = save_path.stat().st_size if os.path.exists(save_path) else 0
             if not got or size < MIN_VALID_PDF_BYTES:
