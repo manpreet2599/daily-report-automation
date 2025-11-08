@@ -19,7 +19,6 @@ def today_ist(): return datetime.now(IST)
 def today_ddmmyyyy(): return today_ist().strftime("%d/%m/%Y")
 def today_fname(): return today_ist().strftime("%d-%m-%Y")
 
-# ---------------- small utils ----------------
 async def wait_ms(ms): await asyncio.sleep(ms/1000.0)
 
 async def panel_has_data(panel) -> bool:
@@ -40,14 +39,14 @@ async def panel_has_data(panel) -> bool:
     except Exception:
         return False
 
-# ---------------- robust dropdown setter (selectpicker + multiselect + native) ----------------
+# ---------- Robust dropdown setter: selectpicker/multiselect/native + direct UI clicking ----------
 SET_SELECT_VALUES = r"""
 (root, cfg) => {
   const { candidates, values, selectAll, exact } = cfg;
   const norm = s => (s||'').trim();
   const lower = s => norm(s).toLowerCase();
 
-  // find element from candidates
+  // resolve the hidden/native <select>
   let el = null;
   for (const q of candidates) {
     const e = root.querySelector(q) || document.querySelector(q);
@@ -56,13 +55,13 @@ SET_SELECT_VALUES = r"""
   if (!el) return {ok:false, reason:'select not found', selected:[]};
 
   const hasJQ = !!window.jQuery;
-  const isSelectPicker = hasJQ && (typeof window.jQuery(el).selectpicker === 'function');
-  const isMultiSelect  = hasJQ && (typeof window.jQuery(el).multiselect   === 'function');
+  const isSelectPicker = !!(el && (el.closest('.bootstrap-select') ||
+                                   document.querySelector(`.bootstrap-select[data-id="${el.id}"]`)));
+  const isMultiSelect  = hasJQ && (typeof window.jQuery(el).multiselect === 'function');
 
   const pickTexts = Array.isArray(values) ? values : [];
   const want = pickTexts.map(v => exact ? norm(v) : lower(v));
 
-  // helper: find option values to set
   const allOpts = Array.from(el.options || []).map(o => ({
     text: norm(o.textContent||o.label||''),
     value: o.value
@@ -78,43 +77,110 @@ SET_SELECT_VALUES = r"""
     return picked;
   };
 
-  try {
-    if (isSelectPicker) {
-      const $el = window.jQuery(el);
-      const vals = matchValues();
-      try { $el.selectpicker('deselectAll'); } catch(e){}
-      if (selectAll) {
-        $el.selectpicker('val', allOpts.map(o=>o.value));
-      } else {
-        $el.selectpicker('val', vals);
+  const readDisplayText = () => {
+    // read the selectpicker button label if present
+    let box = null;
+    if (el.id) box = document.querySelector(`.bootstrap-select[data-id="${el.id}"]`);
+    if (!box) box = el.closest('.bootstrap-select');
+    if (box) {
+      const inner = box.querySelector('.filter-option-inner-inner, .filter-option-inner');
+      if (inner) return norm(inner.textContent||'');
+    }
+    // fallback to selected options
+    const selected = Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
+    return selected.join(', ');
+  };
+
+  const clickUIAndPick = () => {
+    // drive the visible dropdown directly
+    let box = null;
+    if (el.id) box = document.querySelector(`.bootstrap-select[data-id="${el.id}"]`);
+    if (!box) box = el.closest('.bootstrap-select');
+    if (!box) return false;
+    const btn = box.querySelector('button.dropdown-toggle');
+    if (!btn) return false;
+
+    // open
+    btn.click();
+    const menu = document.querySelector('.dropdown-menu.show') || box.querySelector('.dropdown-menu');
+    if (!menu) { try{btn.click();}catch(e){} return false; }
+
+    const itemNodes = Array.from(menu.querySelectorAll('li:not(.disabled) a, li:not(.disabled) .text, .dropdown-item'))
+      .filter(n => norm(n.textContent||''));
+    if (itemNodes.length === 0) { try{document.body.click();}catch(e){} return false; }
+
+    const chooseOne = (needle) => {
+      const w = exact ? norm(needle) : lower(needle);
+      const found = itemNodes.find(n => {
+        const t = norm(n.textContent||'');
+        return exact ? (t === w) : lower(t).includes(w);
+      });
+      if (found) {
+        (found.closest('a') || found).click();
+        return true;
       }
-      try{$el.selectpicker('render');}catch(e){}
-      try{$el.selectpicker('refresh');}catch(e){}
-      el.dispatchEvent(new Event('change',{bubbles:true}));
-    } else if (isMultiSelect) {
-      const $el = window.jQuery(el);
-      try { $el.multiselect('deselectAll', false); } catch(e){}
-      if (selectAll) {
-        try { $el.multiselect('selectAll', false); } catch(e){}
-      } else {
-        const vals = matchValues();
-        try { $el.multiselect('select', vals); } catch(e){}
+      return false;
+    };
+
+    if (selectAll) {
+      // click all visible options (except "None selected")
+      for (const n of itemNodes) {
+        const t = norm(n.textContent||'');
+        if (t && lower(t) !== 'none selected') {
+          (n.closest('a') || n).click();
+        }
       }
-      try { $el.multiselect('refresh'); } catch(e){}
-      try { $el.multiselect('updateButtonText'); } catch(e){}
-      el.dispatchEvent(new Event('change',{bubbles:true}));
     } else {
-      // Native multi/select
+      for (const t of pickTexts) chooseOne(t);
+    }
+
+    // close
+    try { document.body.click(); } catch(e) {}
+    try { btn.blur(); } catch(e) {}
+    try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
+
+    return true;
+  };
+
+  try {
+    // 1) If selectpicker UI exists, prefer clicking the visible menu
+    let usedUI = false;
+    if (isSelectPicker) {
+      usedUI = clickUIAndPick();
+      // try to refresh plugin if available
+      try {
+        if (hasJQ && typeof window.jQuery(el).selectpicker === 'function') {
+          const $el = window.jQuery(el);
+          try{$el.selectpicker('render');}catch(e){}
+          try{$el.selectpicker('refresh');}catch(e){}
+        }
+      } catch(e){}
+    }
+
+    // 2) If UI path failed or this isn't selectpicker, set underlying <select>
+    if (!usedUI) {
       const vals = matchValues();
       const setAll = new Set(vals);
-      if (el.multiple) {
-        for (const o of el.options) o.selected = selectAll ? true : setAll.has(o.value);
+      if (isMultiSelect) {
+        const $el = window.jQuery(el);
+        try { $el.multiselect('deselectAll', false); } catch(e){}
+        if (selectAll) {
+          try { $el.multiselect('selectAll', false); } catch(e){}
+        } else {
+          try { $el.multiselect('select', vals); } catch(e){}
+        }
+        try { $el.multiselect('refresh'); } catch(e){}
+        try { $el.multiselect('updateButtonText'); } catch(e){}
       } else {
-        for (const o of el.options) o.selected = false;
-        if (vals[0] != null) {
-          const v = vals[0];
-          const targ = Array.from(el.options).find(o => o.value === v);
-          if (targ) targ.selected = true;
+        if (el.multiple) {
+          for (const o of el.options) o.selected = selectAll ? true : setAll.has(o.value);
+        } else {
+          for (const o of el.options) o.selected = false;
+          if (vals[0] != null) {
+            const v = vals[0];
+            const targ = Array.from(el.options).find(o => o.value === v);
+            if (targ) targ.selected = true;
+          }
         }
       }
       el.dispatchEvent(new Event('input',{bubbles:true}));
@@ -122,12 +188,11 @@ SET_SELECT_VALUES = r"""
     }
   } catch(e) {}
 
-  // close any open dropdown by clicking body
-  try { document.body.click(); } catch(e) {}
-  try { document.activeElement && document.activeElement.blur && document.activeElement.blur(); } catch(e) {}
-
-  const selected = Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
-  return {ok: selected.length>0, selected};
+  // final readback
+  const labelText = readDisplayText();
+  const selected = labelText ? [labelText] : Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
+  const ok = selected.length>0 && selected[0].toLowerCase() !== 'none selected';
+  return {ok, selected};
 }
 """
 
@@ -140,6 +205,17 @@ READ_SELECTED = r"""
     if (e) { el = e; break; }
   }
   if (!el) return [];
+  // prefer button label if selectpicker
+  let box = null;
+  if (el.id) box = document.querySelector(`.bootstrap-select[data-id="${el.id}"]`);
+  if (!box) box = el.closest('.bootstrap-select');
+  if (box) {
+    const inner = box.querySelector('.filter-option-inner-inner, .filter-option-inner');
+    if (inner) {
+      const txt = norm(inner.textContent||'');
+      if (txt) return [txt];
+    }
+  }
   return Array.from(el.selectedOptions||[]).map(o=>norm(o.textContent||o.label||o.value||'')).filter(Boolean);
 }
 """
@@ -156,12 +232,11 @@ async def set_dropdown(panel, candidates, *, values=None, select_all=False, exac
     log(f"[filter] {label or candidates[0]} → {picked if picked else 'None'} (ok={ok})")
     return ok
 
-# ---------------- site hooks ----------------
+# -------- site hooks / waits ----------
 CALL_DIVISION_LIST = r"""(root)=>{ try{ if(typeof window.DivisionList==='function') window.DivisionList(); }catch(e){} return true; }"""
 
 async def wait_division_option_text(page, candidates, division_text, timeout_ms=25000):
     end = time.time() + timeout_ms/1000.0
-    wanted = division_text.lower().strip()
     while time.time() < end:
         try:
             found = await page.evaluate("""(cands, text)=>{
@@ -185,7 +260,7 @@ async def wait_division_option_text(page, candidates, division_text, timeout_ms=
         await wait_ms(250)
     return False
 
-# ---------------- dates + show ----------------
+# -------- dates + show --------
 FILL_DATES_JS = r"""
 (root, cfg) => {
   const { fromDDMMYYYY, toDDMMYYYY } = cfg;
@@ -227,7 +302,7 @@ async def click_show_report(panel):
       if(!btn) return false; btn.click(); return true;
     }""")
 
-# ---------------- PDF helpers ----------------
+# -------- PDF helpers --------
 async def click_pdf_icon(panel):
     for sel in [
         "xpath=.//img[contains(@src,'pdf') or contains(@alt,'PDF')]",
@@ -277,7 +352,6 @@ async def render_dom_table_pdf(panel, pdf_path: Path):
     }""")
     table_html = (payload or {}).get("tableHTML") or ""
     if not table_html:
-        # screenshot -> pdf fallback
         png = await panel.screenshot(type="png")
         b64 = base64.b64encode(png).decode("ascii")
         ctx = panel.page.context
@@ -318,7 +392,7 @@ async def render_dom_table_pdf(panel, pdf_path: Path):
     await tmp.close()
     log(f"[pdf:dom] table-only → {pdf_path}")
 
-# ---------------- login helpers ----------------
+# ---------- login helpers ----------
 USERNAME_CANDS = [
     "#username", "input#username",
     "input[name='username']", "input[name='loginid']", "input[name='userid']", "input[name='login']",
@@ -340,10 +414,8 @@ async def fill_any(page, cands, value) -> bool:
         try:
             loc = page.locator(sel).first
             if await loc.count():
-                await loc.fill(value)
-                return True
-        except Exception:
-            pass
+                await loc.fill(value); return True
+        except Exception: pass
     return False
 
 async def click_any(page, cands, timeout=6000) -> bool:
@@ -351,11 +423,8 @@ async def click_any(page, cands, timeout=6000) -> bool:
         try:
             loc = page.locator(sel).first
             if await loc.count():
-                await loc.click(timeout=timeout)
-                return True
-        except Exception:
-            pass
-    # text finder fallback
+                await loc.click(timeout=timeout); return True
+        except Exception: pass
     try:
         el = page.get_by_text("Login", exact=False)
         await el.first.click(timeout=timeout)
@@ -375,13 +444,12 @@ async def wait_for_any_selector(page, cands, timeout_ms=30000) -> bool:
         await wait_ms(200)
     return False
 
-# ---------------- main flow ----------------
+# ---------- main flow ----------
 async def site_login_and_download():
     login_url = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
     username  = os.environ["USERNAME"]
     password  = os.environ["PASSWORD"]
     user_type = os.getenv("USER_TYPE", "").strip()
-    stamp     = today_fname()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -390,7 +458,7 @@ async def site_login_and_download():
         )
         context = await browser.new_context(accept_downloads=True)
 
-        # block only fonts (keep css/js/images so fields render)
+        # Only block fonts; keep CSS/JS/images so widgets render.
         async def speed_filter(route, request):
             if request.resource_type in ("font",):
                 await route.abort()
@@ -399,52 +467,41 @@ async def site_login_and_download():
         await context.route("**/*", speed_filter)
 
         page = await context.new_page()
-
         log(f"Opening login page: {login_url}")
         await page.goto(login_url, wait_until="domcontentloaded")
 
-        # choose user type first if provided
         if user_type:
             for sel in USERTYPE_CANDS:
                 if await page.locator(sel).count():
                     try:
-                        await page.select_option(sel, value=user_type)
-                        break
+                        await page.select_option(sel, value=user_type); break
                     except Exception:
-                        try:
-                            await page.select_option(sel, label=user_type)
-                            break
-                        except Exception:
-                            pass
+                        try: await page.select_option(sel, label=user_type); break
+                        except Exception: pass
 
-        # wait until any username/password field appears
         ok_presence = await wait_for_any_selector(page, USERNAME_CANDS + PASSWORD_CANDS, timeout_ms=30000)
         if not ok_presence:
             raise RuntimeError("Login inputs not found on page")
 
-        # fill creds (robust)
-        u_ok = await fill_any(page, USERNAME_CANDS, username)
-        p_ok = await fill_any(page, PASSWORD_CANDS, password)
-        if not u_ok or not p_ok:
-            raise RuntimeError(f"Could not fill credentials (user_ok={u_ok}, pass_ok={p_ok})")
+        if not await fill_any(page, USERNAME_CANDS, username):
+            raise RuntimeError("Could not fill username")
+        if not await fill_any(page, PASSWORD_CANDS, password):
+            raise RuntimeError("Could not fill password")
 
-        # click login
-        clicked = await click_any(page, LOGIN_BUTTON_CANDS, timeout=6000)
-        if not clicked:
-            raise RuntimeError("Could not click Login button")
+        if not await click_any(page, LOGIN_BUTTON_CANDS, timeout=6000):
+            raise RuntimeError("Could not click Login")
 
         await page.wait_for_load_state("domcontentloaded")
         log("Login step complete.")
         log(f"Current URL: {page.url}")
 
-        # ---- get Application Wise Report panel ----
+        # Application Wise Report panel
         panel = page.locator(
             "xpath=//div[.//text()[contains(translate(.,'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'),'application wise report')]]"
         ).first
         await panel.wait_for(state="visible", timeout=20000)
         log("[nav] Application Wise Report panel ready.")
 
-        # selectors (broad candidates)
         circle_cands   = ['#circle_office','#circle','#circleId','select[name*="circle" i]']
         division_cands = ['#division_office','#division','#divisionId','select[name*="division" i]']
         nature_cands   = ['#nature_of_application','#nature','#natureId','select[name*="nature" i]']
@@ -459,7 +516,7 @@ async def site_login_and_download():
             ok = await set_dropdown(panel, circle_cands, values=["LUDHIANA CANAL CIRCLE"], exact=True, label="Circle Office")
             if not ok: raise RuntimeError("Circle Office selection failed")
 
-            # trigger site hook & wait for Division population
+            # Division list often loads after circle
             try: await panel.evaluate(CALL_DIVISION_LIST)
             except Exception: pass
             await wait_division_option_text(page, division_cands, "FARIDKOT CANAL AND GROUND WATER DIVISION", timeout_ms=25000)
@@ -468,7 +525,7 @@ async def site_login_and_download():
             ok = await set_dropdown(panel, division_cands, values=["FARIDKOT CANAL AND GROUND WATER DIVISION"], exact=True, label="Division Office")
             if not ok: raise RuntimeError("Division Office selection failed")
 
-            # Nature: select all (must be before Status)
+            # Nature → All (before Status)
             ok = await set_dropdown(panel, nature_cands, select_all=True, label="Nature Of Application (Select All)")
             if not ok: raise RuntimeError("Nature selection failed")
 
@@ -476,7 +533,7 @@ async def site_login_and_download():
             ok = await set_dropdown(panel, status_cands, values=[status_text], exact=True, label="Status")
             if not ok: raise RuntimeError("Status selection failed")
 
-            # Dates: 26/07/2024 → today
+            # Dates 26/07/2024 → today
             f = "26/07/2024"; t = today_ddmmyyyy()
             res = await panel.evaluate(FILL_DATES_JS, {"fromDDMMYYYY": f, "toDDMMYYYY": t})
             log(f"[dates] set: from='{f}' to='{t}' -> {res}")
@@ -485,7 +542,7 @@ async def site_login_and_download():
             if not await click_show_report(panel):
                 raise RuntimeError("Show Report button not found")
 
-            # wait for rows
+            # wait rows
             for _ in range(40):
                 if await panel_has_data(panel): break
                 await wait_ms(250)
@@ -494,7 +551,7 @@ async def site_login_and_download():
 
             save_path = OUT / f"{base_name} {today_fname()}.pdf"
 
-            # try native pdf
+            # try native server PDF
             got = await click_and_wait_download(page, lambda: click_pdf_icon_or_fail(panel), save_path, timeout_ms=35000)
             size = save_path.stat().st_size if os.path.exists(save_path) else 0
             if not got or size < MIN_VALID_PDF_BYTES:
@@ -506,11 +563,9 @@ async def site_login_and_download():
 
         a = await run_one("DELAYED", "Delayed Apps")
         b = await run_one("PENDING", "Pending Apps")
-
         await context.close(); await browser.close()
         return [a, b]
 
-# ---------------- entry ----------------
 async def main():
     files = await site_login_and_download()
     log("Downloads complete: " + ", ".join(Path(f).name for f in files))
