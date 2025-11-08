@@ -1,143 +1,126 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, base64, re
+import os, sys, asyncio, traceback, re, json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# ------------ paths / settings ------------
+# -------------------------- paths / flags --------------------------
 BASE = Path(__file__).resolve().parent
-OUT  = BASE.parent / "out"
+OUT = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
-IST = timezone(timedelta(hours=5, minutes=30))
-def now_ist(): return datetime.now(IST)
-def today_ddmmyyyy(): return now_ist().strftime("%d/%m/%Y")
-def today_fname(): return now_ist().strftime("%d-%m-%Y")
-def log(m): print(m, flush=True)
+DEBUG = os.getenv("DEBUG", "0") == "1"
 
-# PDFs smaller than this were the blank server exports you saw
-MIN_VALID_PDF_BYTES = 50000
+# -------------------------- small utils ---------------------------
+def ist_now():
+    return datetime.now(timezone(timedelta(hours=5, minutes=30)))
 
-# ------------ constants ------------
-LOGIN_URL   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
-BASE_ORIGIN = "https://esinchai.punjab.gov.in"
+def today_str():
+    # dd-mm-yyyy for filenames
+    return ist_now().strftime("%d-%m-%Y")
 
-# Endpoints (from HAR + sane fallbacks)
-SHOW_REPORT_ENDPOINTS = [
-    "/Authorities/applicationwisereport.jsp",
-    "/Authorities/applicationwisereport.do",
-]
-PDF_EXPORT_ENDPOINTS = [
-    "/Authorities/applicationwisereportpdf.jsp",
-    "/Authorities/applicationwisereport.pdf",
-]
+def today_ddmmyyyy():
+    # dd/mm/yyyy for form
+    return ist_now().strftime("%d/%m/%Y")
 
-# Your selections
-CIRCLE   = "LUDHIANA CANAL CIRCLE"
-DIVISION = "FARIDKOT CANAL AND GROUND WATER DIVISION"
-NATURE_ALL = [
-    "Amendment in Warabandi",
-    "Change of alignment of watercourse",
-    "Conversion of U.C.A. to C.C.A.",
-    "Demand of new watercourse",
-    "Inclusion of out of chak area",
-    "New Warabandi",
-    "Restoration of running watercourse that has been dismantled",
-    "Sanction of new outlet",
-    "Shifting of head of outlet",
-    "Splitting of existing outlet",
-    "Transfer of area from one outlet to another",
+def log(msg): 
+    print(msg, flush=True)
+
+async def snap(page, name, full=False):
+    if not DEBUG: 
+        return
+    try:
+        await page.screenshot(path=str(OUT / name), full_page=bool(full))
+    except Exception:
+        pass
+
+# ===================== HTML → TABLE PICKER (SCORER) =====================
+
+REPORT_HEADER_HINTS = [
+    "sr", "sr.", "application", "farmer", "village", "outlet",
+    "status", "date", "remarks", "justification", "mobile", "khasra"
 ]
 
-FROM_DATE = "26/07/2024"
-TO_DATE   = today_ddmmyyyy()
-
-# ------------ utilities ------------
-async def save_response_to_file(resp, dest: Path) -> int:
-    body = await resp.body()
-    dest.write_bytes(body)
-    size = dest.stat().st_size
-    log(f"[net] saved → {dest} ({size} bytes)")
-    return size
-
-async def render_html_to_pdf(page, html: str, pdf_path: Path, landscape: bool = True):
-    """Render provided HTML into a fresh page → PDF."""
-    ctx = page.context
-    tmp = await ctx.new_page()
-    await tmp.set_content(html, wait_until="load")
-    await tmp.emulate_media(media="print")
-    await tmp.pdf(path=str(pdf_path), format="A4", print_background=True, landscape=landscape)
-    await tmp.close()
-    log(f"[pdf:dom] rendered → {pdf_path}")
-
-def build_filters_header_html(status_text: str):
-    def li(name, val):
-        if isinstance(val, list): val = ", ".join(val)
-        return f"<li><b>{name}:</b> {val}</li>"
-    return f"""
-    <h1 style="margin:0 0 6px 0;font:600 16px Arial">E-SINSCHAI: APPLICATION WISE DETAILS REPORT</h1>
-    <div style="font:13px Arial;margin:6px 0 10px 0;"><b>Period:</b> From {FROM_DATE} to {TO_DATE}</div>
-    <ul style="margin:6px 0 12px 18px;font:13px Arial">
-      {li("Circle Office", CIRCLE)}
-      {li("Division Office", DIVISION)}
-      {li("Nature Of Application", NATURE_ALL)}
-      {li("Status", status_text)}
-    </ul>
+def _score_table(html: str) -> int:
     """
+    Score a <table> fragment:
+      • rows/cols density
+      • presence of report-like headers
+      • numeric density
+    Higher score → more likely to be the report grid.
+    """
+    low = html.lower()
+    rows = len(re.findall(r"<tr\b", low))
+    ths  = len(re.findall(r"<th\b", low))
+    tds  = len(re.findall(r"<td\b", low))
 
-# ---- NEW: precise report table extractor ----
+    header_hits = 0
+    head_slice = low[: min(len(low), 8000)]
+    for kw in REPORT_HEADER_HINTS:
+        if re.search(rf"\b{re.escape(kw)}", head_slice):
+            header_hits += 1
+
+    nums = len(re.findall(r">\s*\d[\d/\-]*\s*<", low))
+
+    return rows*8 + ths*5 + tds*3 + header_hits*12 + min(nums, 120)
+
 def extract_report_table(raw_html: str) -> str:
     """
-    Return just the main data <table> that appears under the green 'E-SINSCHAI...' header.
-    Strategy:
-      1) Find the header text (case-insensitive).
-      2) From there, capture the *first* full <table>...</table>.
-      3) If that fails, choose the *largest* table in the document as a fallback.
+    Pick the most report-like <table> from raw server HTML.
+    Fallback: largest table by length.
     """
     if not raw_html:
         return ""
 
-    html = raw_html
-    low = html.lower()
-
-    # 1) Anchor near the green header text
-    header_pat = re.compile(r"e[-\s]*sins?chai:?\s*application\s*wise\s*details\s*report", re.I)
-    m = header_pat.search(low)
-    start_idx = m.start() if m else 0
-
-    # 2) From the anchor, get the next full table
     table_pat = re.compile(r"<table\b[^>]*>.*?</table>", re.I | re.S)
-    m2 = table_pat.search(html, pos=start_idx)
-    if m2:
-        return html[m2.start():m2.end()]
+    matches = list(table_pat.finditer(raw_html))
+    if not matches:
+        return ""
 
-    # 3) Fallback: pick the largest table in the whole doc
-    tables = list(table_pat.finditer(html))
-    if tables:
-        tables.sort(key=lambda mm: (mm.end() - mm.start()), reverse=True)
-        return html[tables[0].start():tables[0].end()]
+    scored = []
+    for m in matches:
+        frag = raw_html[m.start():m.end()]
+        scored.append((_score_table(frag), m.start(), m.end(), frag))
 
-    return ""
+    scored.sort(key=lambda x: x[0], reverse=True)
+    best_score, s, e, frag = scored[0]
 
-def wrap_report_html(raw_html: str, status_text: str) -> str:
+    # If best is suspiciously tiny, use the largest table by length
+    if (e - s) < 1500 and len(scored) > 1:
+        frag = max(scored, key=lambda x: x[2]-x[1])[3]
+
+    return frag
+
+# ===================== RENDERER (nice, printable) =====================
+
+def build_filters_header_html(status_text: str, from_str: str, to_str: str) -> str:
+    # Simple summary above the table. You can tweak labels here freely.
+    return f"""
+    <h1>Application Wise Report</h1>
+    <ul>
+      <li><b>Status:</b> {status_text}</li>
+      <li><b>Period:</b> From {from_str} to {to_str}</li>
+    </ul>
     """
-    Build a clean, printable page that shows:
-      - Our explicit filters header (with dd/mm/yyyy),
-      - Only the main report table (no filter widgets / labels).
+
+def wrap_report_html(raw_html: str, status_text: str, from_str: str, to_str: str) -> str:
     """
-    head = build_filters_header_html(status_text)
+    Build a printable page with:
+      - our explicit filter summary
+      - only the best-scored data table (no filter UI)
+    """
+    head = build_filters_header_html(status_text, from_str, to_str)
     table_html = extract_report_table(raw_html)
     if not table_html:
-        # last resort: render full HTML (better than blank)
+        # last resort: dump everything
         table_html = raw_html
 
     return f"""<!doctype html><html><head><meta charset="utf-8"/>
     <style>
       @page {{ size: A4 landscape; margin: 10mm; }}
-      html, body {{ background:#fff; }}
       body {{ font: 12px Arial, Helvetica, sans-serif; color:#111; }}
       h1 {{ font-size: 16px; margin: 0 0 6px 0; }}
       ul {{ margin:6px 0 12px 18px; padding:0; }}
@@ -152,233 +135,275 @@ def wrap_report_html(raw_html: str, status_text: str) -> str:
       {table_html}
     </body></html>"""
 
-# ------------ login helpers ------------
-USERNAME_CANDS = [
-    "#username","input#username","input[name='username']","input[name='loginid']",
-    "input[name='userid']","input[name='login']",
-    "input[placeholder*='email' i]","input[placeholder*='mobile' i]","input[placeholder*='login' i]"
-]
-PASSWORD_CANDS = ["#password","input#password","input[name='password']","input[name='pwd']","input[placeholder='Password']"]
-USERTYPE_CANDS = ["select#usertype","select#userType","select[name='userType']","select#user_type"]
-LOGIN_BUTTON_CANDS = [
-    "button:has-text('Login')","button:has-text('Sign in')","button[type='submit']","[role='button']:has-text('Login')"
-]
-
-async def fill_any(page, cands, value) -> bool:
-    for sel in cands:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count():
-                await loc.fill(value)
-                return True
-        except Exception:
-            pass
-    return False
-
-async def click_any(page, cands, timeout=8000) -> bool:
-    for sel in cands:
-        try:
-            loc = page.locator(sel).first
-            if await loc.count():
-                await loc.click(timeout=timeout)
-                return True
-        except Exception:
-            pass
-    return False
-
-# ------------ core: replay the requests ------------
-async def post_show_report(page, status_text: str):
+async def render_dom_pdf(context, html: str, save_path: Path):
     """
-    Replays the Show Report form submit using the logged-in request context.
-    Returns (ok: bool, html: str | None).
+    Open a fresh page with our HTML and print to PDF.
     """
-    params_variants = []
-    for nature_key in ("natureOfApplication", "natureOfApplication[]", "nature", "nature[]"):
-        params_variants.append({
-            "circleOffice": CIRCLE,
-            "divisionOffice": DIVISION,
-            nature_key: NATURE_ALL,
-            "status": status_text,
-            "fromDate": FROM_DATE,
-            "toDate": TO_DATE
-        })
+    page = await context.new_page()
+    await page.set_content(html, wait_until="load")
+    await page.pdf(path=str(save_path), format="A4", landscape=True, margin={"top":"10mm","bottom":"10mm","left":"10mm","right":"10mm"})
+    await page.close()
 
-    for path in SHOW_REPORT_ENDPOINTS:
-        url = BASE_ORIGIN + path
-        for form in params_variants:
-            try:
-                resp = await page.request.post(url, form=form, timeout=60000)
-                ok = resp.ok
-                ctype = resp.headers.get("content-type","").lower()
-                text = await resp.text()
-                contains_table = ("<table" in text.lower()) and ("tbody" in text.lower())
-                log(f"[show] POST {path} → {resp.status} {ctype}; table={contains_table}")
-                if ok:
-                    return True, text
-            except Exception as e:
-                log(f"[show] error@{path}: {e}")
-    return False, None
+# ===================== REPORT POST (no flaky UI clicks) =====================
 
-async def fetch_pdf(page, status_text: str, save_path: Path) -> bool:
+REPORT_URL = "/Authorities/applicationwisereport.jsp"
+
+async def goto_report_page(page):
     """
-    Calls the PDF export endpoint directly with the same parameters.
+    Open the Application Wise Report page (to ensure session + same origin).
+    If the menu is brittle, direct-goto still works post-login.
     """
-    # parameter variants
-    params_sets = []
-    for nature_key in ("natureOfApplication", "natureOfApplication[]", "nature", "nature[]"):
-        base = {
-            "circleOffice": CIRCLE,
-            "divisionOffice": DIVISION,
-            "status": status_text,
-            "fromDate": FROM_DATE,
-            "toDate": TO_DATE
+    base = re.match(r"^(https?://[^/]+)", page.url)
+    if base:
+        root = base.group(1)
+    else:
+        root = "https://esinchai.punjab.gov.in"
+    url = root + REPORT_URL
+    await page.goto(url, wait_until="domcontentloaded")
+
+async def post_show_report(page, status_text: str, from_str: str, to_str: str, tag: str):
+    """
+    Serialize the existing form on the report page, inject Status + Dates,
+    and POST using page.evaluate(fetch). Returns (ok, html_text).
+    Also saves the raw HTML to out/server_{tag}.html for inspection.
+    """
+    js = """
+    async ({statusText, fromStr, toStr}) => {
+      const form = document.querySelector("form") || document.forms[0];
+      if (!form) return { ok:false, reason: "form not found" };
+
+      const action = form.getAttribute("action") || location.pathname;
+      const fd = new FormData(form);
+
+      // Try common names
+      const trySet = (names, val) => {
+        for (const n of names) {
+          if (fd.has(n)) { fd.set(n, val); return true; }
         }
-        params_sets.append({**base, nature_key: NATURE_ALL})
+        // If missing, add the first name as new field
+        if (names.length) { fd.append(names[0], val); return true; }
+        return false;
+      };
 
-    # 1) GET
-    for path in PDF_EXPORT_ENDPOINTS:
-        url = BASE_ORIGIN + path
-        for params in params_sets:
-            try:
-                resp = await page.request.get(url, params=params, timeout=60000)
-                ctype = resp.headers.get("content-type","").lower()
-                if resp.ok and "pdf" in ctype:
-                    size = await save_response_to_file(resp, save_path)
-                    if size >= MIN_VALID_PDF_BYTES:
-                        return True
-                    log(f"[pdf] server PDF looks small ({size} bytes).")
-            except Exception as e:
-                log(f"[pdf] GET error@{path}: {e}")
+      // Inject our filters:
+      trySet(["status","statusId","appStatus","applicationStatus"], statusText);
+      trySet(["fromDate","fromdate","from_date"], fromStr);
+      trySet(["toDate","todate","to_date"], toStr);
 
-    # 2) POST
-    for path in PDF_EXPORT_ENDPOINTS:
-        url = BASE_ORIGIN + path
-        for form in params_sets:
-            try:
-                resp = await page.request.post(url, form=form, timeout=60000)
-                ctype = resp.headers.get("content-type","").lower()
-                if resp.ok and "pdf" in ctype:
-                    size = await save_response_to_file(resp, save_path)
-                    if size >= MIN_VALID_PDF_BYTES:
-                        return True
-                    log(f"[pdf] server PDF looks small ({size} bytes).")
-            except Exception as e:
-                log(f"[pdf] POST error@{path}: {e}")
+      // Some servers require a submit button name/value
+      if (!fd.has("submit") && !fd.has("show") && !fd.has("Show Report")) {
+        fd.append("submit", "Show Report");
+      }
 
-    return False
+      try {
+        const resp = await fetch(action, {
+          method: "POST",
+          body: fd,
+          credentials: "same-origin"
+        });
+        const ct = resp.headers.get("content-type") || "";
+        const text = await resp.text();
+        return { ok:true, status: resp.status, ct, text };
+      } catch (e) {
+        return { ok:false, reason: String(e) };
+      }
+    }
+    """
+    res = await page.evaluate(js, {"statusText": status_text, "fromStr": from_str, "toStr": to_str})
+    if not res or not res.get("ok"):
+        log(f"[show] POST failed: {res}")
+        return False, ""
 
-async def render_from_show_html(page, show_html: str, status_text: str, pdf_path: Path):
-    """Guaranteed non-empty: render the HTML returned by Show Report POST."""
-    printable = wrap_report_html(show_html, status_text)
-    await render_html_to_pdf(page, printable, pdf_path, landscape=True)
+    text = res.get("text") or ""
+    ct   = (res.get("ct") or "").lower()
+    status = res.get("status")
 
-# ------------ Telegram ------------
-async def send_via_telegram(paths):
+    # Quick presence check of a grid/table
+    has_table = bool(re.search(r"<table\b.*?<tr\b", text, re.I | re.S))
+    log(f"[show] POST {REPORT_URL} → {status} {ct}; table={has_table}")
+
+    # Save raw server HTML for troubleshooting
+    try:
+        (OUT / f"server_{tag}.html").write_text(text, encoding="utf-8")
+    except Exception:
+        pass
+
+    return True, text
+
+# ===================== TELEGRAM =====================
+
+async def send_via_telegram(files):
     bot = os.getenv("TELEGRAM_BOT_TOKEN")
     chat = os.getenv("TELEGRAM_CHAT_ID")
     if not bot or not chat:
-        log("[tg] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping Telegram.")
         return
     import requests
-    for p in paths:
-        name = Path(p).name
-        try:
-            with open(p, "rb") as f:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{bot}/sendDocument",
-                    data={"chat_id": chat},
-                    files={"document": (name, f, "application/pdf")},
-                    timeout=60
-                )
-            if r.status_code != 200:
-                log(f"[tg] send failed for {name}: {r.text}")
-            else:
-                log(f"[tg] sent {name}")
-        except Exception as e:
-            log(f"[tg] error sending {name}: {e}")
+    for p in files:
+        with open(p, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot}/sendDocument",
+                data={"chat_id": chat},
+                files={"document": (Path(p).name, f, "application/pdf")}
+            )
+        if r.status_code == 200:
+            log(f"[tg] sent {Path(p).name}")
+        else:
+            log(f"[tg] failed {Path(p).name}: {r.text}")
 
-# ------------ main flow ------------
+# ===================== LOGIN =====================
+
+async def safe_fill(page, selectors, value):
+    for sel in selectors:
+        try:
+            if await page.locator(sel).count():
+                await page.fill(sel, value); return True
+        except Exception:
+            pass
+    return False
+
+async def safe_click(page, selectors, timeout=5000):
+    for sel in selectors:
+        try:
+            if await page.locator(sel).count():
+                await page.locator(sel).first.click(timeout=timeout); return True
+        except Exception:
+            pass
+    return False
+
+async def do_login(context, login_url, username, password, user_type=""):
+    page = await context.new_page()
+    log(f"Opening login page: {login_url}")
+    last_err = None
+    for _ in range(2):
+        try:
+            await page.goto(login_url, wait_until="domcontentloaded"); break
+        except PWTimeout as e:
+            last_err = e
+    if last_err: 
+        raise last_err
+
+    # Optional user type
+    if user_type:
+        for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
+            try:
+                if await page.locator(sel).count():
+                    try:
+                        await page.select_option(sel, value=user_type)
+                        break
+                    except Exception:
+                        try:
+                            await page.select_option(sel, label=user_type)
+                            break
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    await safe_fill(page,
+        ["#username","input[name='username']","input[placeholder*='Login']","input[placeholder*='Email']","input[placeholder*='Mobile']"],
+        username
+    )
+    await safe_fill(page,
+        ["#password","input[name='password']","input[name='pwd']","input[placeholder='Password']"],
+        password
+    )
+    await safe_click(page,
+        ["button:has-text('Login')","button:has-text('Sign in')","button[type='submit']","[role='button']:has-text('Login')"],
+        timeout=6000
+    )
+
+    await page.wait_for_load_state("domcontentloaded", timeout=60000)
+    log("Login complete.")
+    log(f"Current URL: {page.url}")
+    return page
+
+# ===================== MAIN FLOW =====================
+
+async def run_one(context, base_page, status_text: str, title: str, from_str: str, to_str: str):
+    """
+    Ensures we're on the report page, posts with our filters, renders clean PDF.
+    """
+    # Ensure we're on the report page (same origin & cookies)
+    await goto_report_page(base_page)
+
+    tag = status_text.lower().replace(" ", "_")
+    ok, server_html = await post_show_report(base_page, status_text, from_str, to_str, tag)
+    if not ok or not server_html:
+        raise RuntimeError(f"Show Report POST failed for {status_text}")
+
+    # If the server's own export is blank, we always render DOM ourselves.
+    fname = f"{title} {today_str()}.pdf"
+    out_path = OUT / fname
+
+    # Build clean HTML and render
+    html = wrap_report_html(server_html, status_text, from_str, to_str)
+    await render_dom_pdf(context, html, out_path)
+    log(f"[pdf:dom] rendered → {out_path}")
+    log(f"Saved {out_path.name}")
+    return str(out_path)
+
 async def site_login_and_download():
-    username = os.environ["USERNAME"]
-    password = os.environ["PASSWORD"]
+    login_url = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
+    username  = os.environ["USERNAME"]
+    password  = os.environ["PASSWORD"]
     user_type = os.getenv("USER_TYPE", "").strip()
+
+    # Dates: your requested window
+    from_str = "26/07/2024"
+    to_str   = today_ddmmyyyy()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--no-first-run","--disable-popup-blocking"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-breakpad",
+                "--disable-client-side-phishing-detection",
+                "--disable-default-apps",
+                "--disable-hang-monitor",
+                "--disable-ipc-flooding-protection",
+                "--disable-popup-blocking",
+                "--disable-prompt-on-repost",
+                "--metrics-recording-only",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
+            ]
         )
         context = await browser.new_context(accept_downloads=True)
-        page = await context.new_page()
 
-        log(f"Opening login page: {LOGIN_URL}")
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        # Keep CSS/JS/images; only block fonts to reduce flakiness
+        async def speed_filter(route, request):
+            if request.resource_type in ("font",):
+                await route.abort()
+            else:
+                await route.continue_()
+        await context.route("**/*", speed_filter)
 
-        if user_type:
-            for sel in USERTYPE_CANDS:
-                if await page.locator(sel).count():
-                    try:
-                        await page.select_option(sel, value=user_type); break
-                    except Exception:
-                        try: await page.select_option(sel, label=user_type); break
-                        except Exception: pass
+        context.set_default_timeout(30000)
+        context.set_default_navigation_timeout(90000)
 
-        if not await fill_any(page, USERNAME_CANDS, username):
-            raise RuntimeError("Username input not found")
-        if not await fill_any(page, PASSWORD_CANDS, password):
-            raise RuntimeError("Password input not found")
-        if not await click_any(page, LOGIN_BUTTON_CANDS, timeout=8000):
-            raise RuntimeError("Could not click Login")
+        # Login
+        page = await do_login(context, login_url, username, password, user_type=user_type)
 
-        await page.wait_for_load_state("domcontentloaded")
-        log("Login complete.")
-        log(f"Current URL: {page.url}")
-
-        async def run_one(status_text: str, base_name: str):
-            # 1) Prepare server state + capture the full HTML of the report
-            ok, show_html = await post_show_report(page, status_text)
-
-            pdf_path = OUT / f"{base_name} {today_fname()}.pdf"
-
-            # 2) Try the server's PDF export
-            got = await fetch_pdf(page, status_text, pdf_path)
-            if got:
-                log(f"Saved {pdf_path.name}")
-                return str(pdf_path)
-
-            # 3) Guaranteed fallback using the HTML returned by Show Report
-            if not ok or not show_html:
-                log("[warn] Show Report HTML not captured; using white-page screenshot fallback.")
-                # last-resort: screenshot → PDF
-                png = await page.screenshot(type="png", full_page=True)
-                b64 = base64.b64encode(png).decode("ascii")
-                html = f"""<!doctype html><html><head><meta charset="utf-8">
-                <style>html,body{{margin:0}}.wrap{{padding:8mm}}img{{width:100%}}</style></head>
-                <body><div class="wrap"><img src="data:image/png;base64,{b64}"/></div></body></html>"""
-                await render_html_to_pdf(page, html, pdf_path, landscape=False)
-                log(f"Saved {pdf_path.name}")
-                return str(pdf_path)
-
-            log("[warn] Direct server PDF still small/blank. Falling back to DOM render from POST HTML.")
-            await render_from_show_html(page, show_html, status_text, pdf_path)
-            log(f"Saved {pdf_path.name}")
-            return str(pdf_path)
-
-        a = await run_one("DELAYED", "Delayed Apps")
-        b = await run_one("PENDING", "Pending Apps")
+        # Run both reports
+        delayed_path = await run_one(context, page, "DELAYED", "Delayed Apps", from_str, to_str)
+        pending_path = await run_one(context, page, "PENDING", "Pending Apps", from_str, to_str)
 
         await context.close(); await browser.close()
-        return [a, b]
 
-# ------------ entrypoint ------------
+    return [delayed_path, pending_path]
+
 async def main():
     files = await site_login_and_download()
-    log("Downloads complete: " + ", ".join(Path(f).name for f in files))
-    # Telegram send (best-effort; does not abort on error)
+    log("Downloads complete: " + ", ".join([Path(f).name for f in files]))
     try:
         await send_via_telegram(files)
     except Exception as e:
-        log(f"[tg] send error (continuing): {e}")
+        log(f"Telegram send error (continuing): {e}")
 
 if __name__ == "__main__":
     try:
