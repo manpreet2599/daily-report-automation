@@ -2,8 +2,8 @@
 import os, sys, re, asyncio, traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
-from playwright.async_api import async_playwright, TimeoutError as PWTimeout
+from typing import Optional, Callable
+from playwright.async_api import async_playwright, TimeoutError as PWTimeout, BrowserContext, Page
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -33,7 +33,7 @@ def today_ist_slashes() -> str:
 # Core: robust login and navigation
 # =====================================================================================
 
-async def login(context, login_url: str, username: str, password: str):
+async def login(context: BrowserContext, login_url: str, username: str, password: str) -> Page:
     page = await context.new_page()
     log(f"Opening login page: {login_url}")
 
@@ -53,43 +53,37 @@ async def login(context, login_url: str, username: str, password: str):
         log(f"Current URL: {page.url}")
         return page
 
-    # Pick user type if present (XEN per your usage)
+    # Select user type if present (XEN in your setup)
     for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
         if await page.locator(sel).first.count():
             try:
-                await page.select_option(sel, value="XEN")
-                break
+                await page.select_option(sel, value="XEN"); break
             except Exception:
                 try:
-                    await page.select_option(sel, label="XEN")
-                    break
+                    await page.select_option(sel, label="XEN"); break
                 except Exception:
                     pass
 
-    # Fill username
-    u_ok = False
+    # Username
     for sel in ["#username","input[name='username']","#loginid","input[name='loginid']",
                 "input[placeholder*='Login' i]","input[placeholder*='Email' i]","input[placeholder*='Mobile' i]"]:
         if await page.locator(sel).first.count():
             try:
                 await page.fill(sel, username, timeout=7000)
-                u_ok = True
                 break
             except Exception:
                 pass
 
-    # Fill password
-    p_ok = False
+    # Password
     for sel in ["#password","input[name='password']","#pwd","input[name='pwd']","input[placeholder='Password']"]:
         if await page.locator(sel).first.count():
             try:
                 await page.fill(sel, password, timeout=7000)
-                p_ok = True
                 break
             except Exception:
                 pass
 
-    # Click login
+    # Click Login
     clicked = False
     for sel in ["button:has-text('Login')","button:has-text('Sign in')","button[type='submit']",
                 "[role='button']:has-text('Login')","input[type='submit'][value*='Login']"]:
@@ -100,8 +94,7 @@ async def login(context, login_url: str, username: str, password: str):
                 break
             except Exception:
                 pass
-
-    if not clicked and p_ok:
+    if not clicked:
         try:
             await page.keyboard.press("Enter")
         except Exception:
@@ -132,7 +125,7 @@ async def login(context, login_url: str, username: str, password: str):
     return page
 
 
-async def goto_report_page(page):
+async def goto_report_page(page: Page) -> None:
     """
     Navigate directly to /Authorities/applicationwisereport.jsp.
     Consider ready when we see Show Report button, Status label or the heading.
@@ -207,7 +200,6 @@ SET_SELECT_BY_LABEL_JS = """
     .find(l => norm(l.textContent).includes(norm(labelText)));
   const findSelect = (root) => {
     if (!root) return null;
-    // priority: sibling select, then nearest select in container
     let s = L && L.nextElementSibling && L.nextElementSibling.matches('select') ? L.nextElementSibling : null;
     if (!s) {
       const cands = Array.from((root.closest('div')||root).querySelectorAll('select'));
@@ -281,7 +273,7 @@ SET_INPUT_BY_LABEL_JS = """
 }
 """
 
-async def set_dropdown_by_label(page, label_text: str, value_text: str, exact=True) -> bool:
+async def set_dropdown_by_label(page: Page, label_text: str, value_text: str, exact=True) -> bool:
     try:
         res = await page.evaluate(SET_SELECT_BY_LABEL_JS, label_text, value_text, bool(exact))
         ok = bool(res.get("ok"))
@@ -291,7 +283,7 @@ async def set_dropdown_by_label(page, label_text: str, value_text: str, exact=Tr
     except Exception:
         return False
 
-async def select_all_multiselect(page, label_text: str) -> bool:
+async def select_all_multiselect(page: Page, label_text: str) -> bool:
     try:
         res = await page.evaluate(SELECT_ALL_IN_MULTI_JS, label_text)
         ok = bool(res.get("ok"))
@@ -302,7 +294,7 @@ async def select_all_multiselect(page, label_text: str) -> bool:
     except Exception:
         return False
 
-async def set_input_date(page, label_text: str, value_ddmmyyyy: str) -> bool:
+async def set_input_date(page: Page, label_text: str, value_ddmmyyyy: str) -> bool:
     try:
         res = await page.evaluate(SET_INPUT_BY_LABEL_JS, label_text, value_ddmmyyyy)
         return bool(res.get("ok"))
@@ -314,22 +306,39 @@ async def set_input_date(page, label_text: str, value_ddmmyyyy: str) -> bool:
 # =====================================================================================
 
 def has_table(html: str) -> bool:
-    # very relaxed check
     return "<table" in html.lower() and "</table>" in html.lower()
 
-async def click_show_report_and_capture(page) -> Optional[str]:
+async def wait_response_on_context(
+    context: BrowserContext,
+    predicate: Callable,
+    timeout_ms: int = 30000
+):
+    # Generic helper to wait for a response via context (works across Playwright versions)
+    fut = asyncio.create_task(context.wait_for_event("response", predicate=predicate, timeout=timeout_ms))
+    try:
+        resp = await fut
+        return resp
+    except Exception:
+        try:
+            fut.cancel()
+        except Exception:
+            pass
+        return None
+
+async def click_show_report_and_capture(context: BrowserContext, page: Page) -> Optional[str]:
     """
-    Clicks Show Report on the page and captures the POST HTML response
-    from /Authorities/applicationwisereport.jsp. Returns HTML text or None.
+    Clicks Show Report and captures the POST HTML response
+    from /Authorities/applicationwisereport.jsp using context.wait_for_event.
+    Returns HTML text or None.
     """
-    # prepare waiter
     def _match(resp):
         try:
             return (resp.request.method == "POST") and ("/Authorities/applicationwisereport.jsp" in resp.url)
         except Exception:
             return False
 
-    waiter = page.wait_for_response(_match, timeout=30000)
+    # Start the waiter first
+    waiter_task = asyncio.create_task(wait_response_on_context(context, _match, timeout_ms=30000))
 
     # click Show Report
     clicked = False
@@ -344,25 +353,24 @@ async def click_show_report_and_capture(page) -> Optional[str]:
     if not clicked:
         raise RuntimeError("Show Report button not found")
 
-    # await response
-    try:
-        resp = await waiter
-        body = await resp.text()
-        ctype = resp.headers.get("content-type","").lower()
-        ok = ("text/html" in ctype) and has_table(body)
-        log(f"[show] POST /Authorities/applicationwisereport.jsp → {resp.status} {ctype}; table={ok}")
-        return body if ok else None
-    except Exception:
+    # await response (context-level)
+    resp = await waiter_task
+    if not resp:
         log("[show] POST capture failed or timed out.")
         return None
 
-async def render_html_to_pdf(context, html: str, save_path: Path) -> None:
-    """
-    Spins up a fresh page, injects the server HTML into a minimal printable wrapper,
-    and prints to PDF.
-    """
+    try:
+        body = await resp.text()
+    except Exception:
+        body = ""
+
+    ctype = resp.headers.get("content-type","").lower()
+    ok = ("text/html" in ctype) and has_table(body)
+    log(f"[show] POST /Authorities/applicationwisereport.jsp → {resp.status} {ctype}; table={ok}")
+    return body if ok else None
+
+async def render_html_to_pdf(context: BrowserContext, html: str, save_path: Path) -> None:
     page = await context.new_page()
-    # Basic wrapper to ensure fonts/backgrounds render
     wrapped = f"""
 <!doctype html><html>
 <head>
@@ -384,7 +392,6 @@ async def render_html_to_pdf(context, html: str, save_path: Path) -> None:
     """.strip()
 
     await page.set_content(wrapped, wait_until="load")
-    # give dynamic images/fonts a brief chance (safe even if none)
     try:
         await page.wait_for_load_state("networkidle", timeout=5000)
     except Exception:
@@ -399,7 +406,7 @@ async def render_html_to_pdf(context, html: str, save_path: Path) -> None:
 # One run: set filters, dates, show, capture, render
 # =====================================================================================
 
-async def run_one(context, page, status_text: str, name_prefix: str, from_str: str, to_str: str) -> str:
+async def run_one(context: BrowserContext, page: Page, status_text: str, name_prefix: str, from_str: str, to_str: str) -> str:
     # Navigate to report page (idempotent)
     await goto_report_page(page)
 
@@ -408,18 +415,15 @@ async def run_one(context, page, status_text: str, name_prefix: str, from_str: s
     if not ok_c:
         log("[filter] Circle Office could not be set (will proceed anyway).")
 
-    # Division list may load after Circle; give it a short moment
     await page.wait_for_timeout(700)
     ok_d = await set_dropdown_by_label(page, "Division Office", "FARIDKOT CANAL AND GROUND WATER DIVISION", exact=True)
     if not ok_d:
         log("[filter] Division Office could not be set (will proceed anyway).")
 
-    # Nature of Application: select all
     ok_n = await select_all_multiselect(page, "Nature Of Application")
     if not ok_n:
         log("[filter] Nature Of Application select-all failed (will proceed anyway).")
 
-    # Status
     ok_s = await set_dropdown_by_label(page, "Status", status_text, exact=False)
     if not ok_s:
         log(f"[filter] Status '{status_text}' could not be set (will proceed anyway).")
@@ -431,10 +435,9 @@ async def run_one(context, page, status_text: str, name_prefix: str, from_str: s
         log(f"[dates] Warning: failed to set one or both dates (From='{from_str}', To='{to_str}'). Proceeding.")
 
     # Click Show Report and capture server POST HTML
-    html = await click_show_report_and_capture(page)
+    html = await click_show_report_and_capture(context, page)
     if not html:
-        log("[warn] Direct server PDF still small/blank or POST HTML not usable. Falling back to DOM render from current page HTML.")
-        # take current page HTML as last resort
+        log("[warn] Direct server PDF still small/blank or POST HTML not usable. Falling back to DOM of current page.")
         try:
             html = await page.content()
         except Exception:
