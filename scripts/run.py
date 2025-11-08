@@ -13,26 +13,26 @@ OUT  = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
 IST = timezone(timedelta(hours=5, minutes=30))
-def today_ist(): return datetime.now(IST)
-def today_ddmmyyyy(): return today_ist().strftime("%d/%m/%Y")
-def today_fname(): return today_ist().strftime("%d-%m-%Y")
+def now_ist(): return datetime.now(IST)
+def today_ddmmyyyy(): return now_ist().strftime("%d/%m/%Y")
+def today_fname(): return now_ist().strftime("%d-%m-%Y")
 def log(m): print(m, flush=True)
 
-# “small/blank” PDFs from the server were ~29–30 KB in your logs
+# PDFs smaller than this were the blank server exports you saw
 MIN_VALID_PDF_BYTES = 50000
 
-# ------------ constants from your report ------------
+# ------------ constants ------------
 LOGIN_URL   = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
 BASE_ORIGIN = "https://esinchai.punjab.gov.in"
 
-# Endpoints observed in your HAR (and common fallbacks)
+# Endpoints (from HAR + sane fallbacks)
 SHOW_REPORT_ENDPOINTS = [
     "/Authorities/applicationwisereport.jsp",
-    "/Authorities/applicationwisereport.do",   # fallback guess
+    "/Authorities/applicationwisereport.do",
 ]
 PDF_EXPORT_ENDPOINTS = [
     "/Authorities/applicationwisereportpdf.jsp",
-    "/Authorities/applicationwisereport.pdf",  # fallback guess
+    "/Authorities/applicationwisereport.pdf",
 ]
 
 # Your selections
@@ -63,7 +63,8 @@ async def save_response_to_file(resp, dest: Path) -> int:
     log(f"[net] saved → {dest} ({size} bytes)")
     return size
 
-async def render_simple_dom_pdf(page, html: str, pdf_path: Path, landscape: bool = True):
+async def render_html_to_pdf(page, html: str, pdf_path: Path, landscape: bool = True):
+    """Render provided HTML into a fresh page → PDF."""
     ctx = page.context
     tmp = await ctx.new_page()
     await tmp.set_content(html, wait_until="load")
@@ -87,9 +88,42 @@ def build_filters_header_html(status_text: str):
     </ul>
     """
 
-# ------------ login helpers (robust selectors) ------------
+def wrap_report_html(raw_html: str, status_text: str) -> str:
+    """
+    Take the HTML returned by the Show Report POST and wrap it into a clean,
+    printable page with your chosen filters header.
+    """
+    head = build_filters_header_html(status_text)
+    # Try to extract the main report table if present; otherwise keep full HTML.
+    # We search for the first sizeable table.
+    body = raw_html
+    try:
+        lower = raw_html.lower()
+        start = lower.find("<table")
+        if start != -1:
+            end = lower.find("</table>", start)
+            if end != -1:
+                end += len("</table>")
+                body = raw_html[start:end]
+    except Exception:
+        pass
+
+    return f"""<!doctype html><html><head><meta charset="utf-8"/>
+    <style>
+      @page {{ size: A4 landscape; margin: 10mm; }}
+      body {{ font: 12px Arial, Helvetica, sans-serif; color:#111; }}
+      table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
+      th,td {{ border:1px solid #999; padding:6px 8px; vertical-align:top; word-break:break-word; }}
+      th {{ background:#f2f2f2; }}
+    </style></head><body>
+      {head}
+      {body}
+    </body></html>"""
+
+# ------------ login helpers ------------
 USERNAME_CANDS = [
-    "#username","input#username","input[name='username']","input[name='loginid']","input[name='userid']","input[name='login']",
+    "#username","input#username","input[name='username']","input[name='loginid']",
+    "input[name='userid']","input[name='login']",
     "input[placeholder*='email' i]","input[placeholder*='mobile' i]","input[placeholder*='login' i]"
 ]
 PASSWORD_CANDS = ["#password","input#password","input[name='password']","input[name='pwd']","input[placeholder='Password']"]
@@ -109,7 +143,7 @@ async def fill_any(page, cands, value) -> bool:
             pass
     return False
 
-async def click_any(page, cands, timeout=6000) -> bool:
+async def click_any(page, cands, timeout=8000) -> bool:
     for sel in cands:
         try:
             loc = page.locator(sel).first
@@ -121,14 +155,12 @@ async def click_any(page, cands, timeout=6000) -> bool:
     return False
 
 # ------------ core: replay the requests ------------
-async def post_show_report(page, status_text: str) -> bool:
+async def post_show_report(page, status_text: str):
     """
     Replays the Show Report form submit using the logged-in request context.
-    Some JSPs cache criteria in session; doing this first makes the subsequent
-    PDF export deterministic.
+    Returns (ok: bool, html: str | None).
     """
     params_variants = []
-    # Try common key shapes for multi-select
     for nature_key in ("natureOfApplication", "natureOfApplication[]", "nature", "nature[]"):
         params_variants.append({
             "circleOffice": CIRCLE,
@@ -143,24 +175,21 @@ async def post_show_report(page, status_text: str) -> bool:
         url = BASE_ORIGIN + path
         for form in params_variants:
             try:
-                # use application/x-www-form-urlencoded with repeated keys for arrays
-                # Playwright encodes lists as repeated keys when using 'form' argument.
                 resp = await page.request.post(url, form=form, timeout=60000)
                 ok = resp.ok
                 ctype = resp.headers.get("content-type","").lower()
-                text = await resp.text() if "text" in ctype or "html" in ctype else ""
+                text = await resp.text()
                 contains_table = ("<table" in text.lower()) and ("tbody" in text.lower())
                 log(f"[show] POST {path} → {resp.status} {ctype}; table={contains_table}")
                 if ok:
-                    return True
+                    return True, text
             except Exception as e:
                 log(f"[show] error@{path}: {e}")
-    return False
+    return False, None
 
 async def fetch_pdf(page, status_text: str, save_path: Path) -> bool:
     """
     Calls the PDF export endpoint directly with the same parameters.
-    Tries GET with different key shapes (array vs non-array). Falls back to POST if needed.
     """
     # parameter variants
     params_sets = []
@@ -172,10 +201,9 @@ async def fetch_pdf(page, status_text: str, save_path: Path) -> bool:
             "fromDate": FROM_DATE,
             "toDate": TO_DATE
         }
-        # duplicate arrays under different keys
         params_sets.append({**base, nature_key: NATURE_ALL})
 
-    # 1) Try GET on known endpoints
+    # 1) GET
     for path in PDF_EXPORT_ENDPOINTS:
         url = BASE_ORIGIN + path
         for params in params_sets:
@@ -190,7 +218,7 @@ async def fetch_pdf(page, status_text: str, save_path: Path) -> bool:
             except Exception as e:
                 log(f"[pdf] GET error@{path}: {e}")
 
-    # 2) Try POST to the export endpoint (some servers require POST)
+    # 2) POST
     for path in PDF_EXPORT_ENDPOINTS:
         url = BASE_ORIGIN + path
         for form in params_sets:
@@ -207,44 +235,35 @@ async def fetch_pdf(page, status_text: str, save_path: Path) -> bool:
 
     return False
 
-async def dom_fallback_from_grid(page, status_text: str, pdf_path: Path):
-    """
-    If direct export stays small/blank, we render a clean PDF from the live grid HTML.
-    Assumes the grid is already present on the page (manual Show Report already done
-    via post_show_report()).
-    """
-    # Pull just the main table under the green report header
-    payload = await page.evaluate("""() => {
-      const section = document.querySelector('div') || document.body;
-      const tbl = document.querySelector('#myTable') || document.querySelector('table');
-      return {
-        tableHTML: tbl ? tbl.outerHTML : ''
-      };
-    }""")
-    table_html = (payload or {}).get("tableHTML") or ""
-    if not table_html:
-        # Last-resort screenshot → PDF
-        png = await page.screenshot(type="png", full_page=True)
-        b64 = base64.b64encode(png).decode("ascii")
-        html = f"""<!doctype html><html><head><meta charset="utf-8">
-        <style>html,body{{margin:0}}.wrap{{padding:8mm}}img{{width:100%}}</style></head>
-        <body><div class="wrap"><img src="data:image/png;base64,{b64}"/></div></body></html>"""
-        await render_simple_dom_pdf(page, html, pdf_path, landscape=False)
-        return
+async def render_from_show_html(page, show_html: str, status_text: str, pdf_path: Path):
+    """Guaranteed non-empty: render the HTML returned by Show Report POST."""
+    printable = wrap_report_html(show_html, status_text)
+    await render_html_to_pdf(page, printable, pdf_path, landscape=True)
 
-    head = build_filters_header_html(status_text)
-    html = f"""<!doctype html><html><head><meta charset="utf-8"/>
-    <style>
-      @page {{ size: A4 landscape; margin: 10mm; }}
-      body {{ font: 12px Arial, Helvetica, sans-serif; color:#111; }}
-      table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
-      th,td {{ border:1px solid #999; padding:6px 8px; vertical-align:top; word-break:break-word; }}
-      th {{ background:#f2f2f2; }}
-    </style></head><body>
-      {head}
-      {table_html}
-    </body></html>"""
-    await render_simple_dom_pdf(page, html, pdf_path, landscape=True)
+# ------------ Telegram ------------
+async def send_via_telegram(paths):
+    bot = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot or not chat:
+        log("[tg] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping Telegram.")
+        return
+    import requests
+    for p in paths:
+        name = Path(p).name
+        try:
+            with open(p, "rb") as f:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{bot}/sendDocument",
+                    data={"chat_id": chat},
+                    files={"document": (name, f, "application/pdf")},
+                    timeout=60
+                )
+            if r.status_code != 200:
+                log(f"[tg] send failed for {name}: {r.text}")
+            else:
+                log(f"[tg] sent {name}")
+        except Exception as e:
+            log(f"[tg] error sending {name}: {e}")
 
 # ------------ main flow ------------
 async def site_login_and_download():
@@ -284,21 +303,32 @@ async def site_login_and_download():
         log(f"Current URL: {page.url}")
 
         async def run_one(status_text: str, base_name: str):
-            # 1) Session-prepare by replaying Show Report POST
-            ok = await post_show_report(page, status_text)
-            if not ok:
-                log("[warn] Show Report POST did not return HTML 200, continuing to PDF fetch…")
+            # 1) Prepare server state + capture the full HTML of the report
+            ok, show_html = await post_show_report(page, status_text)
 
-            # 2) Export PDF directly
             pdf_path = OUT / f"{base_name} {today_fname()}.pdf"
+
+            # 2) Try the server's PDF export
             got = await fetch_pdf(page, status_text, pdf_path)
             if got:
                 log(f"Saved {pdf_path.name}")
                 return str(pdf_path)
 
-            # 3) Fallback render from DOM (guaranteed non-empty)
-            log("[warn] Direct server PDF still small/blank. Falling back to DOM render.")
-            await dom_fallback_from_grid(page, status_text, pdf_path)
+            # 3) Guaranteed fallback using the HTML returned by Show Report
+            if not ok or not show_html:
+                log("[warn] Show Report HTML not captured; using white-page screenshot fallback.")
+                # last-resort: screenshot → PDF
+                png = await page.screenshot(type="png", full_page=True)
+                b64 = base64.b64encode(png).decode("ascii")
+                html = f"""<!doctype html><html><head><meta charset="utf-8">
+                <style>html,body{{margin:0}}.wrap{{padding:8mm}}img{{width:100%}}</style></head>
+                <body><div class="wrap"><img src="data:image/png;base64,{b64}"/></div></body></html>"""
+                await render_html_to_pdf(page, html, pdf_path, landscape=False)
+                log(f"Saved {pdf_path.name}")
+                return str(pdf_path)
+
+            log("[warn] Direct server PDF still small/blank. Falling back to DOM render from POST HTML.")
+            await render_from_show_html(page, show_html, status_text, pdf_path)
             log(f"Saved {pdf_path.name}")
             return str(pdf_path)
 
@@ -312,6 +342,11 @@ async def site_login_and_download():
 async def main():
     files = await site_login_and_download()
     log("Downloads complete: " + ", ".join(Path(f).name for f in files))
+    # Telegram send (best-effort; does not abort on error)
+    try:
+        await send_via_telegram(files)
+    except Exception as e:
+        log(f"[tg] send error (continuing): {e}")
 
 if __name__ == "__main__":
     try:
