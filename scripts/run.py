@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback, base64
+import os, sys, asyncio, traceback, base64, re
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright
@@ -88,36 +88,68 @@ def build_filters_header_html(status_text: str):
     </ul>
     """
 
+# ---- NEW: precise report table extractor ----
+def extract_report_table(raw_html: str) -> str:
+    """
+    Return just the main data <table> that appears under the green 'E-SINSCHAI...' header.
+    Strategy:
+      1) Find the header text (case-insensitive).
+      2) From there, capture the *first* full <table>...</table>.
+      3) If that fails, choose the *largest* table in the document as a fallback.
+    """
+    if not raw_html:
+        return ""
+
+    html = raw_html
+    low = html.lower()
+
+    # 1) Anchor near the green header text
+    header_pat = re.compile(r"e[-\s]*sins?chai:?\s*application\s*wise\s*details\s*report", re.I)
+    m = header_pat.search(low)
+    start_idx = m.start() if m else 0
+
+    # 2) From the anchor, get the next full table
+    table_pat = re.compile(r"<table\b[^>]*>.*?</table>", re.I | re.S)
+    m2 = table_pat.search(html, pos=start_idx)
+    if m2:
+        return html[m2.start():m2.end()]
+
+    # 3) Fallback: pick the largest table in the whole doc
+    tables = list(table_pat.finditer(html))
+    if tables:
+        tables.sort(key=lambda mm: (mm.end() - mm.start()), reverse=True)
+        return html[tables[0].start():tables[0].end()]
+
+    return ""
+
 def wrap_report_html(raw_html: str, status_text: str) -> str:
     """
-    Take the HTML returned by the Show Report POST and wrap it into a clean,
-    printable page with your chosen filters header.
+    Build a clean, printable page that shows:
+      - Our explicit filters header (with dd/mm/yyyy),
+      - Only the main report table (no filter widgets / labels).
     """
     head = build_filters_header_html(status_text)
-    # Try to extract the main report table if present; otherwise keep full HTML.
-    # We search for the first sizeable table.
-    body = raw_html
-    try:
-        lower = raw_html.lower()
-        start = lower.find("<table")
-        if start != -1:
-            end = lower.find("</table>", start)
-            if end != -1:
-                end += len("</table>")
-                body = raw_html[start:end]
-    except Exception:
-        pass
+    table_html = extract_report_table(raw_html)
+    if not table_html:
+        # last resort: render full HTML (better than blank)
+        table_html = raw_html
 
     return f"""<!doctype html><html><head><meta charset="utf-8"/>
     <style>
       @page {{ size: A4 landscape; margin: 10mm; }}
+      html, body {{ background:#fff; }}
       body {{ font: 12px Arial, Helvetica, sans-serif; color:#111; }}
+      h1 {{ font-size: 16px; margin: 0 0 6px 0; }}
+      ul {{ margin:6px 0 12px 18px; padding:0; }}
       table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
       th,td {{ border:1px solid #999; padding:6px 8px; vertical-align:top; word-break:break-word; }}
       th {{ background:#f2f2f2; }}
+      td {{ font-size: 11px; line-height: 1.25; }}
+      thead {{ display: table-header-group; }}
+      tfoot {{ display: table-footer-group; }}
     </style></head><body>
       {head}
-      {body}
+      {table_html}
     </body></html>"""
 
 # ------------ login helpers ------------
