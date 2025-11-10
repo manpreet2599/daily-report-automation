@@ -1,456 +1,604 @@
 #!/usr/bin/env python3
-import os, sys, asyncio, traceback
+import os, sys, asyncio, traceback, re, json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from playwright.async_api import async_playwright, TimeoutError as PWTimeout
 
-# ------------------ config ------------------
+# ---------- .env & paths ----------
+from dotenv import load_dotenv
+load_dotenv(override=True)
+
 BASE = Path(__file__).resolve().parent
-OUT  = BASE.parent / "out"
+OUT = BASE.parent / "out"
 OUT.mkdir(exist_ok=True)
 
 DEBUG = os.getenv("DEBUG", "0") == "1"
-LOGIN_URL = os.getenv("LOGIN_URL", "https://esinchai.punjab.gov.in/signup.jsp")
-USER_TYPE = os.getenv("USER_TYPE", "").strip()  # e.g. XEN
 
-CIRCLE_TEXT   = "LUDHIANA CANAL CIRCLE"
-DIVISION_TEXT = "FARIDKOT CANAL AND GROUND WATER DIVISION"
+def log(msg: str):
+    print(msg, flush=True)
 
-def ist_today_ddmmyyyy():
+def ist_today_str(fmt="%d-%m-%Y"):
     ist = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist).strftime("%d/%m/%Y")
+    return datetime.now(ist).strftime(fmt)
 
-FROM_DATE = "26/07/2024"
-TO_DATE   = ist_today_ddmmyyyy()
-
-def stamp_for_filename():
-    ist = timezone(timedelta(hours=5, minutes=30))
-    return datetime.now(ist).strftime("%d-%m-%Y")
-
-def log(msg): print(msg, flush=True)
+def require_env(name: str) -> str:
+    val = os.getenv(name)
+    if not val:
+        raise RuntimeError(
+            f"Missing {name}. Add it to your .env or export it before running.\n"
+            f"Required: USERNAME, PASSWORD | Optional: USER_TYPE, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, DEBUG"
+        )
+    return val
 
 async def snap(page, name, full=False):
     if not DEBUG: return
+    try: await page.screenshot(path=str(OUT / name), full_page=bool(full))
+    except Exception: pass
+
+
+# ---------- DOM helpers ----------
+async def get_text(node):
     try:
-        await page.screenshot(path=str(OUT / name), full_page=bool(full))
+        return (await node.inner_text()).strip()
+    except Exception:
+        return ""
+
+async def wait_for_any_selector(page, selectors, timeout=8000):
+    for sel in selectors:
+        try:
+            await page.locator(sel).first.wait_for(state="visible", timeout=timeout)
+            return sel
+        except Exception:
+            pass
+    return None
+
+async def click_first(page, selectors, timeout=6000, force=False):
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.scroll_into_view_if_needed()
+                await loc.click(timeout=timeout, force=force)
+                return True
+        except Exception:
+            pass
+    return False
+
+async def fill_first(page, selectors, value, timeout=6000):
+    for sel in selectors:
+        try:
+            loc = page.locator(sel).first
+            if await loc.count():
+                await loc.fill(value, timeout=timeout)
+                try:
+                    await page.eval_on_selector(sel, "el => {el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true}));}")
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+    return False
+
+
+# ---------- Report page actions ----------
+REPORT_URL = "https://esinchai.punjab.gov.in/Authorities/applicationwisereport.jsp"
+
+async def goto_report_page(page):
+    # Direct jump (fastest & most reliable after login)
+    try:
+        await page.goto(REPORT_URL, wait_until="domcontentloaded", timeout=45000)
     except Exception:
         pass
 
-# ---------- tiny helpers ----------
-async def wait_until_has_data(page, timeout_ms=30000):
-    end = page.context._loop.time() + timeout_ms/1000.0
-    # table with at least one data row (>=2 non-empty cells)
-    js = """
-    () => {
-      const tbodies = Array.from(document.querySelectorAll('table tbody'));
-      for (const tb of tbodies) {
-        const rows = Array.from(tb.querySelectorAll('tr'));
-        for (const r of rows) {
-          const tds = Array.from(r.querySelectorAll('td')).map(td => (td.innerText||'').trim());
-          const nonEmpty = tds.filter(x => x && x !== '\\u00A0');
-          if (nonEmpty.length >= 2) return true;
-        }
-      }
-      return false;
-    }
-    """
-    while page.context._loop.time() < end:
+    # If direct jump didn’t work, try menu path
+    if "applicationwisereport.jsp" not in page.url:
+        log("[nav] Opening via menu…")
+        await click_first(page, ["text=MIS Reports", "a:has-text('MIS Reports')", "nav >> text=MIS Reports"], timeout=6000)
+        await asyncio.sleep(0.2)
+        ok = await click_first(page, ["text=Application Wise Report", "a:has-text('Application Wise Report')"], timeout=6000)
+        if not ok:
+            raise RuntimeError("Could not open 'Application Wise Report' via menu")
         try:
-            ok = await page.evaluate(js)
-            if ok: return True
+            await page.wait_for_url(re.compile(r".*/Authorities/applicationwisereport\.jsp.*"), timeout=20000)
         except Exception:
             pass
-        await asyncio.sleep(0.25)
+
+    await page.wait_for_load_state("domcontentloaded")
+    # Wait for at least one control to show
+    await wait_for_any_selector(page, [
+        "label:has-text('Circle Office')",
+        "label:has-text('Division Office')",
+        "label:has-text('Nature Of Application')",
+        "label:has-text('Status')",
+        "text=Show Report",
+        "input#fromDate", "input#toDate"
+    ], timeout=10000)
+    log("[nav] Application Wise Report page ready.")
+    await snap(page, "after_open_app_wise.png")
+
+
+async def _find_control_near_label(page, label_text):
+    """
+    Returns a dict with keys:
+      kind: 'select'|'bootstrap'|'input'|None
+      handle: selector string for primary control (select/input/button)
+      root: container selector for this section
+    """
+    # Find the label
+    label = page.locator(f"label:has-text('{label_text}')").first
+    if not await label.count():
+        # Try contains (case-insensitive) via xpath
+        label = page.locator(f"xpath=//label[contains(translate(normalize-space(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ','abcdefghijklmnopqrstuvwxyz'), '{label_text.lower()}')]").first
+        if not await label.count():
+            return {"kind": None, "handle": None, "root": None}
+
+    # Prefer sibling select
+    # 1) Direct select after label
+    sib_select = label.locator("xpath=following::select[1]").first
+    if await sib_select.count():
+        return {"kind": "select", "handle": "xpath=(" + await sib_select.evaluate("e => e.outerHTML") + ")", "root": None}
+
+    # 2) Bootstrap-select pattern: a div with .bootstrap-select and a button.dropdown-toggle
+    #    Try label's next container
+    bs_button = label.locator("xpath=following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')]").first
+    if await bs_button.count():
+        return {"kind": "bootstrap", "handle": "xpath=(//label[contains(normalize-space(), \"" + label_text + "\")]/following::*[contains(@class,'bootstrap-select')][1]//button[contains(@class,'dropdown-toggle')])[1]", "root": None}
+
+    # 3) Any input (for dates)
+    date_input = label.locator("xpath=following::input[1]").first
+    if await date_input.count():
+        return {"kind": "input", "handle": "xpath=(//label[contains(normalize-space(), \"" + label_text + "\")]/following::input[1])[1]", "root": None}
+
+    # Fallbacks by known ids / names
+    low = label_text.lower()
+    if "circle" in low:
+        return {"kind": "select", "handle": "select#circle, select#circleId, select[name='circle'], select[name*='circle']", "root": None}
+    if "division" in low:
+        return {"kind": "select", "handle": "select#division, select#divisionId, select[name='division'], select[name*='division']", "root": None}
+    if "status" in low:
+        return {"kind": "select", "handle": "select#status, select#statusId, select[name='status'], select[name*='status']", "root": None}
+    if "nature" in low:
+        # multi-select
+        return {"kind": "select", "handle": "label:has-text('Nature Of Application') ~ select, select[name*='nature']", "root": None}
+    if "from" in low:
+        return {"kind": "input", "handle": "#fromDate, input#fromDate, input[name='fromDate'], input[name*='fromdate' i], input[placeholder*='From' i]", "root": None}
+    if "to" in low:
+        return {"kind": "input", "handle": "#toDate, input#toDate, input[name='toDate'], input[name*='todate' i], input[placeholder*='To' i]", "root": None}
+
+    return {"kind": None, "handle": None, "root": None}
+
+
+async def set_select_by_label(page, label_text: str, wanted_text: str) -> bool:
+    """
+    Works with native <select> and bootstrap-select dropdowns.
+    """
+    info = await _find_control_near_label(page, label_text)
+    kind, handle = info["kind"], info["handle"]
+    if not kind or not handle:
+        return False
+
+    if kind == "select":
+        # Native <select>
+        try:
+            # Prefer label match
+            await page.select_option(handle, label=wanted_text)
+            return True
+        except Exception:
+            try:
+                await page.select_option(handle, value=wanted_text)
+                return True
+            except Exception:
+                pass
+        # Try contains match via JS
+        try:
+            js = """
+            (sel, txt) => {
+              const el = document.querySelector(sel);
+              if (!el) return false;
+              const target = (txt||'').trim().toLowerCase();
+              let idx = -1;
+              for (let i=0;i<el.options.length;i++){
+                const t = (el.options[i].text || '').trim().toLowerCase();
+                if (t.includes(target)){ idx = i; break; }
+              }
+              if (idx === -1) return false;
+              el.selectedIndex = idx;
+              el.dispatchEvent(new Event('input',{bubbles:true}));
+              el.dispatchEvent(new Event('change',{bubbles:true}));
+              return true;
+            }
+            """
+            ok = await page.evaluate(js, handle, wanted_text)
+            return bool(ok)
+        except Exception:
+            return False
+
+    if kind == "bootstrap":
+        try:
+            # Open menu
+            await page.locator(handle).click(timeout=6000)
+            # Find any menu item containing wanted text
+            menu = page.locator(".dropdown-menu.show, .show .dropdown-menu").first
+            await menu.wait_for(timeout=6000)
+            item = menu.locator("li, a, span, .text").filter(has_text=wanted_text).first
+            if not await item.count():
+                # Attempt to scroll & find
+                found = False
+                for _ in range(20):
+                    if await menu.locator("li, a, span, .text").filter(has_text=wanted_text).count():
+                        found = True
+                        break
+                    try:
+                        await menu.evaluate("(m)=>m.scrollBy(0,250)")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
+                if not found:
+                    # close
+                    try: await page.keyboard.press("Escape")
+                    except Exception: pass
+                    return False
+                item = menu.locator("li, a, span, .text").filter(has_text=wanted_text).first
+
+            await item.click(timeout=6000)
+            # Close the open dropdown (the site leaves it open)
+            try: await page.keyboard.press("Escape")
+            except Exception: pass
+            try: await page.mouse.click(10,10)
+            except Exception: pass
+            return True
+        except Exception:
+            try: await page.keyboard.press("Escape")
+            except Exception: pass
+            return False
+
     return False
 
-# Use Bootstrap Select API to set a single-select by visible text.
-SET_BOOTSTRAP_SELECT_BY_TEXT = """
-(el, wantedText) => {
-  // el is the underlying <select> used by bootstrap-select
-  const norm = s => String(s||'').trim().toLowerCase();
-  const w = norm(wantedText);
 
-  // find option whose visible text matches (exact, case-insensitive)
-  let val = null;
-  for (const opt of el.options) {
-    if (norm(opt.textContent) === w) { val = opt.value; break; }
-  }
-  if (val === null) {
-    // try 'contains' match as fallback
-    for (const opt of el.options) {
-      if (norm(opt.textContent).includes(w)) { val = opt.value; break; }
-    }
-  }
-  if (val === null) return {ok:false, reason:'option not found'};
-
-  // set value and fire events
-  el.value = val;
-  el.dispatchEvent(new Event('input',  { bubbles:true }));
-  el.dispatchEvent(new Event('change', { bubbles:true }));
-
-  // refresh bootstrap-select visuals if available
-  try {
-    if (window.$ && typeof window.$(el).selectpicker === 'function') {
-      window.$(el).selectpicker('refresh');
-    }
-  } catch(e){}
-
-  // close any open dropdown (simulate clicking dead-space)
-  try {
-    const btn = el.closest('.bootstrap-select')?.querySelector('button.dropdown-toggle.show');
-    if (btn) btn.blur();
-    const menu = document.querySelector('.dropdown-menu.show');
-    if (menu) menu.classList.remove('show');
-  } catch(e){}
-
-  return {ok:true, value:val, text:wantedText};
-}
-"""
-
-# Select ALL options for the multi-select (Nature Of Application)
-SELECT_ALL_MULTI = """
-(el) => {
-  if (!el) return {ok:false, reason:'no select'};
-  let changed = false;
-  for (const opt of el.options) {
-    if (!opt.selected) { opt.selected = true; changed = true; }
-  }
-  if (changed) {
-    el.dispatchEvent(new Event('input',  { bubbles:true }));
-    el.dispatchEvent(new Event('change', { bubbles:true }));
-  }
-  try {
-    if (window.$ && typeof window.$(el).selectpicker === 'function') {
-      window.$(el).selectpicker('refresh');
-    }
-  } catch(e){}
-  return {ok:true};
-}
-"""
-
-# Fill date input by label text; supports dd/mm/yyyy
-FILL_DATE_BY_LABEL = """
-(labelText, value) => {
-  const norm = s => String(s||'').trim().toLowerCase();
-  const labs = Array.from(document.querySelectorAll('label'));
-  const L = labs.find(l => norm(l.textContent).includes(norm(labelText)));
-  const root = L ? (L.closest('div') || L.parentElement || document) : document;
-  const candidates = [
-    '#fromDate','input#fromDate',"input[name='fromDate']",
-    '#toDate','input#toDate',"input[name='toDate']",
-    "input[name*='fromdate' i]","input[name*='todate' i]",
-    "input[placeholder*='From' i]","input[placeholder*='To' i]"
-  ];
-  for (const sel of candidates) {
-    const el = root.querySelector(sel);
-    if (el && el.tagName === 'INPUT') {
-      el.value = value;
-      el.dispatchEvent(new Event('input',{bubbles:true}));
-      el.dispatchEvent(new Event('change',{bubbles:true}));
-      return true;
-    }
-  }
-  return false;
-}
-"""
-
-async def set_bootstrap_select(page, label_contains_text: str, wanted_text: str):
+async def select_nature_all(page) -> bool:
     """
-    Finds the first <select> next to/under a label that contains label_contains_text
-    and sets it via bootstrap-select API by visible option text.
+    Force-select all options for 'Nature Of Application'.
     """
-    js = """
-    (labelText) => {
-      const norm = s => String(s||'').trim().toLowerCase();
-      const labs = Array.from(document.querySelectorAll('label'));
-      const L = labs.find(l => norm(l.textContent).includes(norm(labelText)));
-      if (!L) return null;
-      const root = L.closest('div') || L.parentElement || document;
-      // Prefer a select inside bootstrap-select wrapper; else any select nearby
-      let sel = root.querySelector('.bootstrap-select select, select');
-      return sel || null;
-    }
-    """
-    sel = await page.evaluate_handle(js, label_contains_text)
-    try:
-        res = await sel.evaluate(SET_BOOTSTRAP_SELECT_BY_TEXT, wanted_text)
-        return bool(res and res.get("ok"))
-    finally:
-        try: await sel.dispose()
-        except Exception: pass
-
-async def select_nature_all(page):
-    js = """
-    () => {
-      const labs = Array.from(document.querySelectorAll('label'));
-      const L = labs.find(l => (l.textContent||'').toLowerCase().includes('nature of application'));
-      if (!L) return {ok:false, reason:'label not found'};
-      const root = L.closest('div') || L.parentElement || document;
-      const sel = root.querySelector('.bootstrap-select select, select[multiple], select');
-      if (!sel) return {ok:false, reason:'select not found'};
-      return (function(el){
-        let changed=false;
-        for (const opt of el.options){ if(!opt.selected){ opt.selected = true; changed=true; } }
-        if (changed){
-          el.dispatchEvent(new Event('input',{bubbles:true}));
-          el.dispatchEvent(new Event('change',{bubbles:true}));
-        }
-        try { if (window.$ && typeof window.$(el).selectpicker==='function') window.$(el).selectpicker('refresh'); } catch(e){}
-        try {
-          const menu = document.querySelector('.dropdown-menu.show');
-          if (menu) menu.classList.remove('show');
-        } catch(e){}
-        return {ok:true};
-      })(sel);
-    }
-    """
-    try:
-        res = await page.evaluate(js)
-        return bool(res and res.get("ok"))
-    except Exception:
+    info = await _find_control_near_label(page, "Nature Of Application")
+    if not info["kind"] or not info["handle"]:
         return False
 
-async def set_date(page, which_label: str, value: str):
-    try:
-        ok = await page.evaluate(FILL_DATE_BY_LABEL, which_label, value)
-        return bool(ok)
-    except Exception:
-        return False
+    if info["kind"] == "select":
+        try:
+            js = """
+            (sel) => {
+              const el = document.querySelector(sel);
+              if (!el) return false;
+              if (!el.options || el.options.length === 0) return false;
+              let changed = false;
+              for (const o of el.options) { if (!o.selected) { o.selected = true; changed = true; } }
+              if (changed) {
+                el.dispatchEvent(new Event('input',{bubbles:true}));
+                el.dispatchEvent(new Event('change',{bubbles:true}));
+              }
+              return true;
+            }
+            """
+            ok = await page.evaluate(js, info["handle"])
+            return bool(ok)
+        except Exception:
+            pass
 
-async def click_show_report(page):
-    # Click the "Show Report" button/input
-    candidates = [
+    if info["kind"] == "bootstrap":
+        try:
+            await page.locator(info["handle"]).click(timeout=6000)
+            menu = page.locator(".dropdown-menu.show, .show .dropdown-menu").first
+            await menu.wait_for(timeout=6000)
+            # click "Select All" if present; otherwise click every option
+            sel_all = menu.locator("text=Select All, text=Select all, text=Select All ").first
+            if await sel_all.count():
+                await sel_all.click(timeout=4000)
+            else:
+                items = menu.locator("li a, .dropdown-item, .text").all()
+                for _ in range(30):
+                    try:
+                        await menu.evaluate("(m)=>m.scrollBy(0,400)")
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.05)
+                # attempt clicking all visible options
+                try:
+                    count = await menu.locator("li a, .dropdown-item, .text").count()
+                    for i in range(count):
+                        try:
+                            await menu.locator("li a, .dropdown-item, .text").nth(i).click(timeout=1500)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            try: await page.keyboard.press("Escape")
+            except Exception: pass
+            try: await page.mouse.click(10,10)
+            except Exception: pass
+            return True
+        except Exception:
+            try: await page.keyboard.press("Escape")
+            except Exception: pass
+            return False
+
+    return False
+
+
+async def set_date_inputs(page, from_str: str, to_str: str) -> bool:
+    okF = await fill_first(page, [
+        "#fromDate", "input#fromDate", "input[name='fromDate']",
+        "input[name*='fromdate' i]", "input[placeholder*='From' i]",
+    ], from_str)
+    okT = await fill_first(page, [
+        "#toDate", "input#toDate", "input[name='toDate']",
+        "input[name*='todate' i]", "input[placeholder*='To' i]",
+    ], to_str)
+    return okF and okT
+
+
+async def click_show_report_and_wait(page) -> bool:
+    await click_first(page, [
         "button:has-text('Show Report')",
         "input[type='button'][value='Show Report']",
         "text=Show Report"
-    ]
-    for sel in candidates:
-        if await page.locator(sel).count():
-            await page.locator(sel).first.click(timeout=5000)
-            return True
-    return False
+    ], timeout=8000)
+    # Wait for table-like content
+    try:
+        await page.wait_for_selector("table, .table, .dataTable", state="visible", timeout=30000)
+    except Exception:
+        pass
 
-async def click_pdf_icon(page):
-    # red pdf icon near the report grid
-    candidates = [
-        "xpath=(//img[contains(@src,'pdf') or contains(@alt,'PDF')])[1]",
-        "xpath=(//a[.//img[contains(@src,'pdf') or contains(@alt,'PDF')]])[1]"
-    ]
-    for sel in candidates:
-        if await page.locator(sel).count():
-            await page.locator(sel).first.scroll_into_view_if_needed()
-            await page.locator(sel).first.click(timeout=6000, force=True)
-            return True
-    return False
+    # Verify rows
+    try:
+        has_rows = await page.evaluate("""
+            () => {
+              const tbodies = Array.from(document.querySelectorAll('table tbody'));
+              for (const tb of tbodies) {
+                const trs = Array.from(tb.querySelectorAll('tr'));
+                for (const tr of trs) {
+                  const tds = Array.from(tr.querySelectorAll('td')).map(td => (td.innerText||'').trim());
+                  if (tds.filter(Boolean).length >= 2) return true;
+                }
+              }
+              return false;
+            }
+        """)
+        return bool(has_rows)
+    except Exception:
+        return False
 
-async def run_once(context, page, status_text: str, file_prefix: str):
-    # Navigate to the report page (menu click path is sometimes flaky; open directly)
-    # Once logged in, this URL is accessible.
-    await page.goto("https://esinchai.punjab.gov.in/Authorities/applicationwisereport.jsp", wait_until="domcontentloaded")
-    await page.wait_for_selector("body", timeout=15000)
-    await snap(page, "opened_report.png")
 
-    # Set filters in UI (Bootstrap Select) exactly like a human:
-    ok_c = await set_bootstrap_select(page, "Circle Office", CIRCLE_TEXT)
-    log(f"[filter] Circle Office → {CIRCLE_TEXT} (ok={ok_c})")
-    # wait Division options populate
-    await asyncio.sleep(0.8)
+async def render_current_panel_to_pdf(context, page, save_path: Path, title: str, filters_text: str):
+    """
+    Takes the visible report table (and header info) and renders a clean PDF.
+    """
+    html = await page.evaluate("""
+        () => {
+          const clone = document.documentElement.cloneNode(true);
+          // Try to isolate the central report panel if possible
+          // Keep all tables
+          // Remove nav/menus if obvious
+          const rmBySel = sel => clone.querySelectorAll(sel).forEach(el => el.remove());
+          rmBySel("nav, header, footer, [role='navigation'], .navbar, .sidebar, .breadcrumbs");
+          // Remove scripts
+          clone.querySelectorAll("script").forEach(s => s.remove());
+          return "<!doctype html>" + clone.outerHTML;
+        }
+    """)
+    # Build a minimal printable frame around the table content
+    # (We’ll not rely on site CSS; add simple table borders for clarity)
+    skeleton = f"""<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>{title}</title>
+<style>
+  @page {{ size: A4 landscape; margin: 12mm; }}
+  body {{ font-family: Arial, sans-serif; font-size: 12px; }}
+  h1 {{ margin: 0 0 6px 0; font-size: 18px; }}
+  .meta {{ margin: 0 0 12px 0; font-size: 12px; color: #333; }}
+  table {{ border-collapse: collapse; width: 100%; }}
+  th, td {{ border: 1px solid #888; padding: 6px 8px; vertical-align: top; }}
+  thead th {{ background: #eee; }}
+</style>
+</head>
+<body>
+  <h1>{title}</h1>
+  <div class="meta">{filters_text}</div>
+  <div id="content">
+    <!-- We will inject extracted tables only to avoid nav detritus -->
+  </div>
+  <script>
+    (function() {{
+      const src = document.createElement('html');
+      src.innerHTML = `{html.replace("`", "\\`")}`;
+      const tables = src.querySelectorAll('table');
+      const content = document.getElementById('content');
+      if (tables.length === 0) {{
+        const p = document.createElement('p');
+        p.textContent = "No rows found.";
+        content.appendChild(p);
+      }} else {{
+        tables.forEach(t => {{
+          // only keep if there are data rows
+          const rows = Array.from(t.querySelectorAll('tbody tr'));
+          const has = rows.some(r => Array.from(r.querySelectorAll('td')).filter(td => (td.innerText||'').trim()).length >= 2);
+          if (has) {{
+            const clone = t.cloneNode(true);
+            // Strip inline widths
+            clone.querySelectorAll('*').forEach(el => el.removeAttribute('width'));
+            content.appendChild(clone);
+            const spacer = document.createElement('div');
+            spacer.style.height = '12px';
+            content.appendChild(spacer);
+          }}
+        }});
+      }}
+    }})();
+  </script>
+</body>
+</html>"""
 
-    ok_d = await set_bootstrap_select(page, "Division Office", DIVISION_TEXT)
-    log(f"[filter] Division Office → {DIVISION_TEXT} (ok={ok_d})")
-    await asyncio.sleep(0.5)
+    pdf_page = await context.new_page()
+    await pdf_page.set_content(skeleton, wait_until="load")
+    await pdf_page.emulate_media(media="screen")
+    await pdf_page.pdf(path=str(save_path), format="A4", landscape=True, print_background=True, margin={"top":"12mm","right":"12mm","bottom":"12mm","left":"12mm"})
+    await pdf_page.close()
+    log(f"[pdf] rendered → {save_path}")
+
+
+# ---------- Main flow ----------
+async def run_one(context, page, status_text: str, title_prefix: str):
+    # Force filters
+    circle = "LUDHIANA CANAL CIRCLE"
+    division = "FARIDKOT CANAL AND GROUND WATER DIVISION"
+
+    ok_c = await set_select_by_label(page, "Circle Office", circle)
+    log(f"[filter] Circle Office → {circle} (ok={ok_c})")
+    # Divisions often load after Circle; small wait helps
+    await asyncio.sleep(0.6)
+    ok_d = await set_select_by_label(page, "Division Office", division)
+    log(f"[filter] Division Office → {division} (ok={ok_d})")
 
     ok_n = await select_nature_all(page)
     log(f"[filter] Nature Of Application → Select All (ok={ok_n})")
-    await asyncio.sleep(0.3)
 
-    ok_s = await set_bootstrap_select(page, "Status", status_text)
+    ok_s = await set_select_by_label(page, "Status", status_text)
     log(f"[filter] Status → {status_text} (ok={ok_s})")
 
-    # Dates
-    ok_f = await set_date(page, "From Date", FROM_DATE)
-    ok_t = await set_date(page, "To Date", TO_DATE)
-    log(f"[dates] From='{FROM_DATE}' set={ok_f}  To='{TO_DATE}' set={ok_t}")
+    # Dates: 26/07/2024 → today (dd/mm/yyyy)
+    from_str = "26/07/2024"
+    to_str   = ist_today_str("%d/%m/%Y")
+    ok_dt = await set_date_inputs(page, from_str, to_str)
+    log(f"[dates] set From='{from_str}' To='{to_str}' (ok={ok_dt})")
 
-    # Show report
-    clicked = await click_show_report(page)
-    if not clicked:
-        raise RuntimeError("Could not click 'Show Report'")
-
-    # Wait for real rows
-    has_rows = await wait_until_has_data(page, timeout_ms=35000)
-    if not has_rows:
-        # Some pages render a "No record" message; try detect quickly
-        try:
-            await page.get_by_text("No record", exact=False).wait_for(timeout=1500)
-            log("[info] The report returned 'No record'.")
-        except Exception:
-            raise RuntimeError("Report table did not populate with data rows.")
-
+    # Show Report and ensure data rows
+    ok_show = await click_show_report_and_wait(page)
+    if not ok_show:
+        # If no rows, still render page so you see “No rows”
+        log("[show] No data rows detected; will still render for diagnosis.")
     await snap(page, f"after_grid_{status_text.lower()}.png")
 
-    # Try the server PDF (red icon)
-    target = OUT / f"{file_prefix} {stamp_for_filename()}.pdf"
+    # Render to PDF from DOM
+    stamp = ist_today_str("%d-%m-%Y")
+    save_path = OUT / f"{title_prefix} {stamp}.pdf"
+    filters_text = f"Circle: {circle} | Division: {division} | Nature: ALL | Status: {status_text} | Period: {from_str} to {to_str}"
+    await render_current_panel_to_pdf(context, page, save_path, f"{title_prefix}", filters_text)
+    return str(save_path)
+
+
+async def login(context, login_url, username, password, user_type):
+    page = await context.new_page()
+    log(f"Opening login page: {login_url}")
+    await page.goto(login_url, wait_until="domcontentloaded", timeout=45000)
+
+    # user type (optional)
+    if user_type:
+        for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
+            try:
+                if await page.locator(sel).count():
+                    try: await page.select_option(sel, value=user_type)
+                    except Exception:
+                        await page.select_option(sel, label=user_type)
+                    break
+            except Exception:
+                pass
+
+    # username / password
+    await fill_first(page, ["#username","input[name='username']","#login","#loginid","input[name='loginid']","input[name='userid']"], username)
+    await fill_first(page, ["#password","input[name='password']","#pwd","input[name='pwd']"], password)
+
+    # click login
+    await click_first(page, [
+        "button:has-text('Login')","button:has-text('Sign in')",
+        "button[type='submit']","[role='button']:has-text('Login')"
+    ], timeout=6000, force=True)
+
+    # wait for dashboard or same page but authenticated
     try:
-        async with page.expect_download(timeout=35000) as dl_info:
-            ok_pdf = await click_pdf_icon(page)
-            if not ok_pdf:
-                raise RuntimeError("PDF icon not found")
-        dl = await dl_info.value
-        await dl.save_as(str(target))
-        size = target.stat().st_size
-        log(f"[pdf] saved → {target}  ({size} bytes)")
-        if size < 50000:
-            log("[warn] Server PDF looks too small; likely blank headers. Try again once after 3s.")
-            await asyncio.sleep(3.0)
-            async with page.expect_download(timeout=35000) as dl2info:
-                await click_pdf_icon(page)
-            dl2 = await dl2info.value
-            await dl2.save_as(str(target))
-            size2 = target.stat().st_size
-            log(f"[pdf] retry size → {size2} bytes")
-            if size2 < 50000:
-                raise RuntimeError("Server PDF remained small; aborting this attempt.")
-    except Exception as e:
-        # If server export still fails/blank, last resort: print the visible table area
-        log(f"[warn] Direct server PDF failed: {e}. Falling back to printing the table node.")
-        # isolate the report panel/table and print to PDF
-        await page.evaluate("""
-        () => {
-          const tbl = document.querySelector('table');
-          if (tbl) tbl.style.boxShadow = 'none';
-        }
-        """)
-        # Use a temporary new page to print full content including table
-        pdf_page = await context.new_page()
-        html = await page.content()
-        await pdf_page.set_content(html, wait_until="domcontentloaded")
-        await pdf_page.emulate_media(media="screen")
-        await pdf_page.pdf(path=str(target), print_background=True, margin={"top":"10mm","bottom":"10mm","left":"10mm","right":"10mm"})
-        await pdf_page.close()
-        log(f"[pdf:fallback] printed → {target}")
+        await page.wait_for_url(re.compile(r".*/Authorities/.*dashboard\.jsp.*"), timeout=25000)
+    except Exception:
+        pass
 
-    return str(target)
+    # If still on signup, but we might be logged-in and redirected later; wait a little
+    await page.wait_for_load_state("domcontentloaded")
+    log("Login complete.")
+    return page
 
-# ------------------ main flow ------------------
+
 async def site_login_and_download():
-    username = os.environ["USERNAME"]
-    password = os.environ["PASSWORD"]
+    login_url = "https://esinchai.punjab.gov.in/signup.jsp"
+    username  = require_env("USERNAME")
+    password  = require_env("PASSWORD")
+    user_type = os.getenv("USER_TYPE", "").strip()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox","--disable-dev-shm-usage","--disable-extensions"]
+            args=[
+                "--no-sandbox","--disable-dev-shm-usage","--disable-extensions",
+                "--disable-background-networking","--disable-client-side-phishing-detection",
+                "--disable-default-apps","--disable-hang-monitor",
+                "--disable-ipc-flooding-protection","--disable-popup-blocking",
+                "--disable-prompt-on-repost","--no-first-run",
+            ],
         )
         context = await browser.new_context(accept_downloads=True)
-        page = await context.new_page()
+        # Block only fonts for speed; keep css/js/img so widgets work
+        async def speed_filter(route, request):
+            if request.resource_type in ("font",):
+                await route.abort()
+            else:
+                await route.continue_()
+        await context.route("**/*", speed_filter)
 
-        # Go login
-        log(f"Opening login page: {LOGIN_URL}")
-        await page.goto(LOGIN_URL, wait_until="domcontentloaded")
+        # Login
+        page = await login(context, login_url, username, password, user_type)
 
-        # Sometimes there is a user type select
-        if USER_TYPE:
-            for sel in ["select#usertype","select#userType","select[name='userType']","select#user_type"]:
-                if await page.locator(sel).count():
-                    try:
-                        await page.select_option(sel, value=USER_TYPE)
-                        break
-                    except Exception:
-                        try:
-                            await page.select_option(sel, label=USER_TYPE)
-                            break
-                        except Exception:
-                            pass
+        # Go to report page
+        await goto_report_page(page)
 
-        # Fill username/password (try several common fields)
-        user_cands = ["#username","input[name='username']","#login","#loginid","input[name='loginid']","input[placeholder*='Login' i]"]
-        pass_cands = ["#password","input[name='password']","#pwd","input[placeholder='Password']"]
-
-        filled_u = False
-        for s in user_cands:
-            if await page.locator(s).count():
-                try:
-                    await page.fill(s, username)
-                    filled_u = True
-                    break
-                except Exception:
-                    pass
-
-        filled_p = False
-        for s in pass_cands:
-            if await page.locator(s).count():
-                try:
-                    await page.fill(s, password)
-                    filled_p = True
-                    break
-                except Exception:
-                    pass
-
-        if not (filled_u and filled_p):
-            raise RuntimeError("Could not find login fields")
-
-        # Click Login
-        btn_cands = [
-            "button:has-text('Login')","button:has-text('Sign in')",
-            "button[type='submit']","[role='button']:has-text('Login')","input[type='submit']"
-        ]
-        clicked = False
-        for s in btn_cands:
-            if await page.locator(s).count():
-                try:
-                    await page.locator(s).first.click(timeout=5000)
-                    clicked = True
-                    break
-                except Exception:
-                    pass
-        if not clicked:
-            # fallback: press Enter on password field
-            try:
-                await page.keyboard.press("Enter")
-            except Exception:
-                pass
-
-        try:
-            await page.wait_for_load_state("domcontentloaded", timeout=60000)
-        except PWTimeout:
-            pass
-
-        log("Login complete.")
-        log(f"Current URL: {page.url}")
-        await snap(page, "step_after_login.png")
-
-        # ---- Run DELAYED then PENDING ----
-        delayed = await run_once(context, page, "DELAYED", "Delayed Apps")
+        # DELAYED
+        delayed = await run_one(context, page, "DELAYED", "Delayed Apps")
         log(f"Saved {Path(delayed).name}")
 
-        # New tab sometimes keeps old state; re-use same page but re-open URL fresh:
-        pending = await run_once(context, page, "PENDING", "Pending Apps")
+        # Navigate fresh for PENDING (same page is fine; we’ll re-apply)
+        await goto_report_page(page)
+        pending = await run_one(context, page, "PENDING", "Pending Apps")
         log(f"Saved {Path(pending).name}")
 
         await context.close(); await browser.close()
-        return [delayed, pending]
 
+    return [delayed, pending]
+
+
+# ---------- Telegram ----------
+async def send_via_telegram(files):
+    bot = os.getenv("TELEGRAM_BOT_TOKEN"); chat = os.getenv("TELEGRAM_CHAT_ID")
+    if not bot or not chat:
+        log("[tg] TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID not set; skipping Telegram."); return
+    import requests
+    for p in files:
+        with open(p, "rb") as f:
+            r = requests.post(
+                f"https://api.telegram.org/bot{bot}/sendDocument",
+                data={"chat_id": chat},
+                files={"document": (Path(p).name, f, "application/pdf")}
+            )
+        if r.status_code != 200:
+            log(f"[tg] send failed for {p}: {r.text}")
+        else:
+            log(f"[tg] sent {Path(p).name}")
+
+
+# ---------- Entry ----------
 async def main():
     files = await site_login_and_download()
     log("Downloads complete: " + ", ".join([Path(f).name for f in files]))
-
-    # Optional Telegram send
-    bot = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat = os.getenv("TELEGRAM_CHAT_ID")
-    if bot and chat:
-        import requests
-        for p in files:
-            with open(p, "rb") as f:
-                r = requests.post(
-                    f"https://api.telegram.org/bot{bot}/sendDocument",
-                    data={"chat_id": chat},
-                    files={"document": (Path(p).name, f, "application/pdf")}
-                )
-            if r.status_code == 200:
-                log(f"[tg] sent {Path(p).name}")
-            else:
-                log(f"[tg] send failed for {Path(p).name}: {r.text}")
+    try:
+        await send_via_telegram(files)
+    except Exception as e:
+        log(f"[tg] error (continuing): {e}")
 
 if __name__ == "__main__":
     try:
